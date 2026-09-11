@@ -1,0 +1,58 @@
+[package]
+name        = "gguf-nv"
+version     = "0.0.1"
+description = "The GGUF model file, read with no file in it: the header in both byte orders and all three versions, the metadata key/value table with every value type and arrays nested to any depth, the tensor-info table with the alignment rule, and the GGML block layouts — F32 through Q8_1, the K-quants and the IQ family — as values giving elements-per-block and bytes-per-block, so a caller can slice one tensor's bytes out of a 40 GB file without decoding any of it.  Every answer about WHERE something is comes back as a byte range.  Dequantisation is deliberately not here.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and a model file is the format that makes the layer easy: a
+# GGUF is an INDEX — a header, two self-describing tables, and a blob
+# whose contents are addressed by offset — so every question this
+# package answers about where something is, is arithmetic over bytes
+# the caller already holds.  Nothing here opens a file, seeks in one or
+# maps one; a caller reading a 40 GB checkpoint gets `GgufRange`s and
+# does its own reads.  There is not one effect row in the package,
+# except the one that BINDS its cost rather than spending it:
+# `ggufread.read_index<S: Read[e]>(…) -> … [e]` is charged whatever the
+# caller's impl supplies (SPEC § 5.6), because the header and both
+# tables are contiguous from byte 0 and a loader really does read them
+# in one pass.
+#
+# No `@tier(embedded)` claim — see README, "The layer, and the claim
+# this package does not make".
+layer       = "core"
+
+category    = "ai"
+
+tags        = ["gguf", "ggml", "llama-cpp", "model", "quantization", "tensor", "sans-io", "inference"]
+repository  = "https://github.com/novolang/gguf-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A model file, without the model"
+
+[dependencies]
+# None, and the two absences are deliberate.
+#
+# NOT ndarray-nv.  This package never holds a tensor — it holds the
+# tensor's NAME, its dimensions, its GGML type and the byte range its
+# data occupies, and hands all four to whoever is going to dequantise.
+# An array library in the dependency list would be downloaded by every
+# consumer and used by no function.
+#
+# NOT a float16 package.  The scalar widths this package reports are
+# integers (`ggufquant.type_bytes`), and the one place a half-precision
+# NUMBER would be needed is dequantisation, which is not here.  A GGUF
+# metadata value is never F16; the metadata value types are the
+# thirteen in `ggufval`, and F32 and F64 are the only two floats among
+# them.

@@ -1,0 +1,178 @@
+// gguferr.nv — what a GGUF file could not be read as, and the two
+// numbers that say why.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ONE FAULT TYPE FOR THE WHOLE PACKAGE.  A reader walking a GGUF moves
+// through four stages — the header, the metadata table, the tensor-info
+// table, the data blob — and a caller almost never wants to handle
+// them separately: whatever went wrong, the file is not a model it can
+// load, and what it has to do is say so and stop.  So there is one
+// enum, and the variants say which stage rather than which type.
+//
+// EVERY VARIANT CARRIES ITS NUMBERS.  A message that says "malformed
+// GGUF" is a message that sends somebody to a hex editor.  The ones
+// here say the offset, the count, the code or the key, because the
+// person reading it is holding a 40 GB file they cannot open in an
+// editor at all, and the offset is the only thing that locates the
+// damage.
+
+// What went wrong, and where.
+//
+// ```novo
+// use gguferr
+//
+// fn main() [io]
+//     let f = GgufBadMagic(1178882115)
+//     println(f.message())
+// ```
+pub enum GgufFault
+    // The first four bytes were not `GGUF` in either byte order.
+    // `got` is the little-endian reading of them, so a reader that
+    // meets a safetensors checkpoint sees the number its own header
+    // starts with rather than a shrug.
+    GgufBadMagic(got: Int)
+    // The version field named a version this package does not read.
+    // `ggufhdr.supported_versions` is the list; 1, 2 and 3 are on it
+    // and everything else stops here rather than being read as 3 and
+    // producing offsets that are off by four bytes per count field.
+    GgufUnsupportedVersion(version: Int)
+    // A read wanted `want` bytes at `at` and the image has `total`.
+    // The one fault a caller doing its own reads meets most, because
+    // a table walked from a truncated download runs off the end long
+    // before anything else notices.
+    GgufTruncated(at: Int, want: Int, total: Int)
+    // A metadata value declared a type code that is not one of the
+    // thirteen.  `ggufval.value_type_of_code` is the mapping.
+    GgufBadValueType(code: Int)
+    // A tensor declared a GGML type code this package does not know.
+    // Not the same fault as a type it knows and cannot dequantise:
+    // this package dequantises nothing, so an unknown CODE is the only
+    // kind of ignorance it has.
+    GgufBadTensorType(code: Int)
+    // An array value nested deeper than `ggufval.max_array_depth`.
+    // The format permits an array whose element type is ARRAY, and
+    // nothing in it bounds the nesting — so a reader that recursed
+    // without a bound would be a stack overflow a file could ask for.
+    GgufArrayTooDeep(depth: Int)
+    // A key was read at the wrong type: `key` held `got` and the
+    // caller asked for `want`.  Both type names are the spellings
+    // `ggufval.value_type_name` gives, so the message and the code use
+    // one vocabulary.
+    GgufWrongValueType(key: Str, want: Str, got: Str)
+    // A key the caller asked for is not in the table.  A fault rather
+    // than an optional on the typed getters, because the typed getters
+    // already return a `Result` for the wrong-type case and a caller
+    // that wants "absent is fine" has `ggufmeta.find`.
+    GgufKeyNotFound(key: Str)
+    // `general.alignment` was present and was not a positive power of
+    // two.  The offsets in the tensor-info table are multiples of it,
+    // so a bad alignment is not a detail to round past — every tensor
+    // range in the file would be wrong.
+    GgufBadAlignment(alignment: Int)
+    // A tensor declared a rank outside `1 ..= ggufinfo.max_rank`.
+    // Rank 0 is not a scalar here, it is a tensor with no dimensions
+    // and no element count, and GGML's own limit is four.
+    GgufBadRank(name: Str, rank: Int)
+    // A tensor's data offset is not a multiple of the file's
+    // alignment.  GGML's reader assumes the alignment when it computes
+    // addresses, so a file that breaks it loads as garbage rather than
+    // failing — which is why this package refuses it instead.
+    GgufMisalignedTensor(name: Str, offset: Int, alignment: Int)
+    // A quantised tensor whose row length is not a whole number of
+    // blocks.  A Q4_K row is 256 elements at a time and a row of 100
+    // has no encoding at all; the file is wrong, not the reader.
+    GgufRaggedRow(name: Str, row: Int, block: Int)
+    // A length field — a string's, an array's, a table's — that no
+    // buffer on this machine could hold.  `what` names the field, so
+    // "metadata_kv_count" and "tensor name" are told apart.
+    GgufCountOverflow(what: Str, count: Int)
+    // A writer was handed `room` bytes and needed `want`.  Answers
+    // FALSE to `is_corrupt`: a buffer too small is a sizing decision
+    // meeting a perfectly good index, and `ggufwrite.index_bound` is
+    // the number to have asked for.
+    GgufOutputFull(want: Int, room: Int)
+    // A dimension, an offset or a count that a signed 64-bit integer
+    // does not hold.  GGUF's counts are unsigned 64-bit and novo-lang's
+    // `Int` is signed, so the top bit is a value this package reports
+    // rather than wraps: a negative tensor size is how a reader that
+    // wrapped it would present itself, hours later, as a corrupt model.
+    GgufUnsignedOverflow(what: Str, bits: Int)
+
+// The rule every `GgufFault` is printed by: name the stage, then give
+// the number that locates it.
+//
+// `Result<T, E>` requires `E: Error` (SPEC § 3.4), so this impl is what
+// makes every fallible signature in the package spellable — it exists
+// whether or not an interface release has anything to say yet.
+impl Error for GgufFault
+    fn message(self) -> Str
+        match self
+            GgufBadMagic(got)                             =>
+                "not a GGUF file: first four bytes read ${got}"
+            GgufUnsupportedVersion(version)               =>
+                "GGUF version ${version} is not one this reader knows"
+            GgufTruncated(at, want, total)                =>
+                "${want} byte(s) at ${at} in an image of ${total}"
+            GgufBadValueType(code)                        =>
+                "metadata value type ${code} is not one of the thirteen"
+            GgufBadTensorType(code)                       =>
+                "GGML tensor type ${code} is not one this reader knows"
+            GgufArrayTooDeep(depth)                       =>
+                "an array nested ${depth} deep"
+            GgufWrongValueType(key, want, got)            =>
+                "key '${key}' holds ${got}, not ${want}"
+            GgufKeyNotFound(key)                          =>
+                "no metadata key '${key}'"
+            GgufBadAlignment(alignment)                   =>
+                "general.alignment is ${alignment}, not a power of two"
+            GgufBadRank(name, rank)                       =>
+                "tensor '${name}' declares rank ${rank}"
+            GgufMisalignedTensor(name, offset, alignment) =>
+                "tensor '${name}' at ${offset} is not a multiple of ${alignment}"
+            GgufRaggedRow(name, row, block)               =>
+                "tensor '${name}' has rows of ${row} and blocks of ${block}"
+            GgufCountOverflow(what, count)                =>
+                "${what} declares ${count} item(s)"
+            GgufOutputFull(want, room)                    =>
+                "${want} byte(s) into room for ${room}"
+            GgufUnsignedOverflow(what, bits)              =>
+                "${what} does not fit a signed Int: bits ${bits}"
+
+// Whether the file itself is wrong, rather than the request.
+//
+// The two that answer false are the two a caller can fix without
+// touching the file: `GgufOutputFull` is a buffer the caller sized, and
+// `GgufKeyNotFound` is a key the caller asked for.  Everything else
+// means the bytes are not a GGUF this reader can trust, and a caller
+// that retried would meet the same answer.
+//
+// ```novo
+// use gguferr
+//
+// fn main() [io]
+//     println("${gguferr.is_corrupt(GgufOutputFull(1024, 16))}")
+//     // : false
+// ```
+pub fn is_corrupt(f: GgufFault) -> Bool
+    todo("gguf-nv.gguferr.is_corrupt")
+
+// The byte offset the fault names, or -1 when it names none.
+//
+// For a tool that prints a hex window around the damage: the three
+// faults that carry a position — the truncated read, the misaligned
+// tensor, and a bad magic, which is always at 0 — answer it, and the
+// rest answer -1.  A caller that wants the window is doing the same
+// arithmetic every time, so it is written once here.
+pub fn fault_offset(f: GgufFault) -> Int
+    todo("gguf-nv.gguferr.fault_offset")
+
+// Which of the four stages the fault came from, as a name: "header",
+// "metadata", "tensors" or "write".
+//
+// The grouping a loader reports to a user: a header fault means "this
+// is not a model file", a metadata fault means "this model file is
+// damaged", a tensors fault means "this model file disagrees with
+// itself", and a write fault means "your buffer".
+pub fn fault_stage(f: GgufFault) -> Str
+    todo("gguf-nv.gguferr.fault_stage")

@@ -1,0 +1,260 @@
+// ggufsurface_tests.nv — the rest of the surface: the typed list
+// getters, the forgiving getters, the encoded-size arithmetic, the
+// writer's push side, and the one signature in the package that binds
+// an effect parameter.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: gguf-nv.<module>.<fn>`.
+//
+// WHY THIS FILE EXISTS SEPARATELY.  The other two suites are about the
+// format — the block layouts, the header, the tables.  This one is
+// about the API: every public function that a caller reaches for and
+// that the first two suites did not have a natural place for.  A
+// function nothing names is a function nobody has read a call site of,
+// and on an interface release that is the only review there is.
+
+use std.test
+use std.bytes
+use ggufhdr
+use ggufval
+use ggufmeta
+use ggufinfo
+use ggufread
+use ggufwrite
+
+// A small table with one of every shape a real checkpoint carries.
+fn sample_meta() -> GgufMeta
+    ggufmeta.of_entries([
+        GgufKv { key: "general.architecture", value: GgufText("llama") },
+        GgufKv { key: "general.name", value: GgufText("a-small-model") },
+        GgufKv { key: "llama.attention.layer_norm_rms_epsilon",
+                 value: GgufReal(GgufTypeFloat32, 0.00001) },
+        GgufKv { key: "llama.rope.scaling.finetuned", value: GgufFlag(false) },
+        GgufKv { key: "tokenizer.ggml.tokens",
+                 value: GgufList(GgufTypeString, [GgufText("a"), GgufText("b")]) },
+        GgufKv { key: "tokenizer.ggml.token_type",
+                 value: GgufList(GgufTypeInt32, [GgufNum(GgufTypeInt32, 1),
+                                                 GgufNum(GgufTypeInt32, 3)]) },
+        GgufKv { key: "tokenizer.ggml.scores",
+                 value: GgufList(GgufTypeFloat32, [GgufReal(GgufTypeFloat32, 0.0),
+                                                   GgufReal(GgufTypeFloat32, -1.0)]) }])
+
+@test
+fn test_every_typed_getter_answers_its_own_family_and_no_other() [io]
+    let m = sample_meta()
+
+    test.case("the raw lookup answers the value and the presence")
+    test.assert_some(ggufmeta.find(m, "general.name"))
+    test.assert_none(ggufmeta.find(m, "general.description"))
+    test.assert(list.len(ggufmeta.entries_of(m)) == 7)
+
+    test.case("a float key answers float_at and not int_at")
+    match ggufmeta.float_at(m, "llama.attention.layer_norm_rms_epsilon")
+        Ok(e)  => test.assert_approx(e, 0.00001, 0.000000001)
+        Err(f) => test.fail(f.message())
+    match ggufmeta.int_at(m, "llama.attention.layer_norm_rms_epsilon")
+        Ok(n)  => test.fail("an epsilon answered ${n}")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("a bool key answers bool_at")
+    match ggufmeta.bool_at(m, "llama.rope.scaling.finetuned")
+        Ok(b)  => test.assert(b == false)
+        Err(f) => test.fail(f.message())
+
+    test.case("a list answers with the element type the file declared")
+    match ggufmeta.list_at(m, "tokenizer.ggml.tokens")
+        Err(f)       => test.fail(f.message())
+        Ok((et, xs)) =>
+            test.assert(ggufval.value_type_code(et) == 8)
+            test.assert(list.len(xs) == 2)
+
+    test.case("and the three specialised list getters do the walk once")
+    match ggufmeta.str_list_at(m, "tokenizer.ggml.tokens")
+        Ok(xs) => test.assert(list.len(xs) == 2)
+        Err(f) => test.fail(f.message())
+    match ggufmeta.int_list_at(m, "tokenizer.ggml.token_type")
+        Ok(xs) => test.assert(list.len(xs) == 2 and xs[1] == 3)
+        Err(f) => test.fail(f.message())
+    match ggufmeta.float_list_at(m, "tokenizer.ggml.scores")
+        Ok(xs) => test.assert(list.len(xs) == 2)
+        Err(f) => test.fail(f.message())
+
+    test.case("a list getter of the wrong family is a fault, not an empty list")
+    match ggufmeta.int_list_at(m, "tokenizer.ggml.tokens")
+        Ok(xs) => test.fail("${list.len(xs)} integers out of a list of strings")
+        Err(f) => test.assert(f.message() != "")
+
+@test
+fn test_the_forgiving_getters_swallow_absence_and_the_wrong_type_alike() [io]
+    let m = sample_meta()
+
+    test.case("a key that is there answers its own value")
+    test.assert(ggufmeta.str_or(m, "general.name", "?") == "a-small-model")
+    test.assert(ggufmeta.bool_or(m, "llama.rope.scaling.finetuned", true) == false)
+    test.assert_approx(ggufmeta.float_or(m, "llama.attention.layer_norm_rms_epsilon", -1.0),
+                       0.00001, 0.000000001)
+
+    test.case("a key that is absent answers the fallback")
+    test.assert(ggufmeta.str_or(m, "general.description", "none") == "none")
+    test.assert(ggufmeta.bool_or(m, "general.description", true))
+    test.assert_approx(ggufmeta.float_or(m, "general.description", -1.0), -1.0, 0.0001)
+
+    test.case("and so does a key of the wrong type, on purpose")
+    // A caller reaching for a default does not want a Result it will
+    // discard; a caller that wanted to know the difference has the
+    // fallible getter beside it.
+    test.assert(ggufmeta.str_or(m, "tokenizer.ggml.tokens", "none") == "none")
+    test.assert(ggufmeta.bool_or(m, "general.name", true))
+
+@test
+fn test_a_value_knows_how_many_bytes_it_will_take_in_each_version() [io]
+    test.case("a string is a length field and its bytes")
+    // "llama" is five bytes.  In version 3 the length is eight bytes
+    // and the type tag is four, so the value is 4 + 8 + 5 = 17.
+    match ggufval.encoded_bytes(GgufText("llama"), 3)
+        Ok(n)  => test.assert(n == 17)
+        Err(f) => test.fail(f.message())
+
+    test.case("and the same string is four bytes smaller in version 1")
+    // Version 1's length field is four bytes: 4 + 4 + 5 = 13.
+    match ggufval.encoded_bytes(GgufText("llama"), 1)
+        Ok(n)  => test.assert(n == 13)
+        Err(f) => test.fail(f.message())
+
+    test.case("a fixed-width value is its tag and its width")
+    match ggufval.encoded_bytes(GgufNum(GgufTypeUint32, 32), 3)
+        Ok(n)  => test.assert(n == 8)
+        Err(f) => test.fail(f.message())
+
+    test.case("an array is a tag, an element type, a count and the items")
+    // 4 for the tag, 4 for the element type, 8 for the count, and two
+    // four-byte items: 4 + 4 + 8 + 8 = 24.
+    let pair = GgufList(GgufTypeUint32, [GgufNum(GgufTypeUint32, 1),
+                                         GgufNum(GgufTypeUint32, 2)])
+    match ggufval.encoded_bytes(pair, 3)
+        Ok(n)  => test.assert(n == 24)
+        Err(f) => test.fail(f.message())
+
+    test.case("and a whole entry adds the key's own length field and bytes")
+    // "general.architecture" is twenty bytes: 8 + 20 for the key, then
+    // the value's 17.
+    let kv = GgufKv { key: "general.architecture", value: GgufText("llama") }
+    match ggufval.kv_bytes(kv, 3)
+        Ok(n)  => test.assert(n == 45)
+        Err(f) => test.fail(f.message())
+
+    test.case("a tensor entry is its name, its rank, its dims, its type and its offset")
+    // 8 + 1 for the name, 4 for the rank, one dim of 8, 4 for the
+    // type and 8 for the offset: 33.
+    let t = GgufTensorInfo { name: "a", dims: [256], kind: GgufQ4_K, offset: 0 }
+    match ggufinfo.entry_bytes(t, 3)
+        Ok(n)  => test.assert(n == 33)
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_the_scalar_accessors_that_the_format_tour_did_not_reach() [io]
+    test.case("a flag answers as_bool and a string answers as_str")
+    match ggufval.as_bool(GgufFlag(true))
+        Some(b) => test.assert(b)
+        None    => test.fail("a flag is not a bool")
+    match ggufval.as_str(GgufText("llama"))
+        Some(s) => test.assert(s == "llama")
+        None    => test.fail("text is not a string")
+
+    test.case("and neither answers for the other")
+    test.assert_none(ggufval.as_bool(GgufText("true")))
+    test.assert_none(ggufval.as_str(GgufNum(GgufTypeUint32, 1)))
+
+    test.case("a list of integers and a list of floats each answer their own")
+    let ints = GgufList(GgufTypeInt32, [GgufNum(GgufTypeInt32, 1)])
+    let reals = GgufList(GgufTypeFloat32, [GgufReal(GgufTypeFloat32, 1.0)])
+    match ggufval.as_int_list(ints)
+        Some(xs) => test.assert(list.len(xs) == 1)
+        None     => test.fail("a list of int32 is not a list of integers")
+    match ggufval.as_float_list(reals)
+        Some(xs) => test.assert(list.len(xs) == 1)
+        None     => test.fail("a list of float32 is not a list of floats")
+    test.assert_none(ggufval.as_int_list(reals))
+    test.assert_none(ggufval.as_float_list(ints))
+
+    test.case("a dump summarises a list rather than expanding it")
+    // `tokenizer.ggml.tokens` on a Llama-3 checkpoint is 128,256
+    // strings, and a dump that printed them is a dump nobody reads
+    // twice.
+    let toks = GgufList(GgufTypeString, [GgufText("a"), GgufText("b")])
+    test.assert(ggufval.describe(toks) != "")
+    test.assert(ggufval.describe(GgufText("llama")) != "")
+
+@test
+fn test_the_index_and_the_header_answer_the_ranges_a_caller_reads() [io]
+    test.case("a version's header has a range as well as a size")
+    match ggufhdr.header_range(3)
+        Ok(r)  => test.assert(r.at == 0 and r.len == 24)
+        Err(f) => test.fail(f.message())
+    match ggufhdr.header_range(1)
+        Ok(r)  => test.assert(r.len == 16)
+        Err(f) => test.fail(f.message())
+
+    test.case("a tensor is found by name in the table")
+    let a = GgufTensorInfo { name: "blk.0.attn_q.weight", dims: [256], kind: GgufQ4_K, offset: 0 }
+    test.assert_some(ggufinfo.find([a], "blk.0.attn_q.weight"))
+    test.assert_none(ggufinfo.find([a], "blk.9.attn_q.weight"))
+
+@test
+fn test_read_index_is_charged_what_the_callers_source_costs() [io]
+    test.case("an in-memory Buffer costs nothing, so this call is effect-free")
+    // `impl Read[] for Buffer` supplies no effects, so `read_index`'s
+    // `[e]` row is empty here — the whole point of binding the trait's
+    // effect parameter rather than naming `[io]`, and the reason this
+    // package's budget is untouched by the one signature in it that
+    // takes a stream.
+    match ggufread.read_index(Buffer.from_str(""))
+        Ok(ix) => test.fail("an empty source parsed as v${ix.header.version}")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("and bytes that are not a GGUF come back as the magic fault")
+    match ggufread.read_index(Buffer.from_str("not a model"))
+        Ok(ix) => test.fail("eleven bytes parsed as v${ix.header.version}")
+        Err(f) => test.assert(f.message() != "")
+
+@test
+fn test_the_writer_takes_entries_one_at_a_time_or_many() [io]
+    let w = ggufwrite.default_writer()
+    let kv = GgufKv { key: "general.architecture", value: GgufText("llama") }
+    let t = GgufTensorInfo { name: "a", dims: [256], kind: GgufQ4_K, offset: 0 }
+
+    test.case("one metadata entry at a time")
+    match ggufwrite.push_kv(w, kv)
+        Ok(w2) => test.assert(list.len(w2.entries) == 1)
+        Err(f) => test.fail(f.message())
+
+    test.case("or several, in order")
+    match ggufwrite.push_kvs(w, [kv, kv])
+        Ok(w2) => test.assert(list.len(w2.entries) == 2)
+        Err(f) => test.fail(f.message())
+
+    test.case("one tensor entry at a time")
+    match ggufwrite.push_tensor(w, t)
+        Ok(w2) => test.assert(list.len(w2.tensors) == 1)
+        Err(f) => test.fail(f.message())
+
+    test.case("or several")
+    match ggufwrite.push_tensors(w, [t, t])
+        Ok(w2) => test.assert(list.len(w2.tensors) == 2)
+        Err(f) => test.fail(f.message())
+
+    test.case("a value nested past the bound is refused where the caller can see it")
+    var deep = GgufText("x")
+    for _i in 0..9
+        deep = GgufList(GgufTypeArray, [deep])
+    match ggufwrite.push_kv(w, GgufKv { key: "deep", value: deep })
+        Ok(w2) => test.fail("a value ${ggufval.value_depth(deep)} deep in a writer with ${list.len(w2.entries)} entries")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("and a rewriter starts from an index with everything already pushed")
+    match ggufread.parse_index(bytes.zeros(0))
+        Ok(ix) =>
+            match ggufwrite.rewriter(ix)
+                Ok(w2) => test.assert(w2.version == ix.header.version)
+                Err(f) => test.fail(f.message())
+        Err(f) => test.assert(f.message() != "")

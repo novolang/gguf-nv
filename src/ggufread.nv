@@ -1,0 +1,256 @@
+// ggufread.nv — the reader, and the load-bearing interface of the
+// package: a state machine that ASKS for byte ranges and is ANSWERED
+// with them, plus the two conveniences over it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE PROBLEM THIS SHAPE SOLVES.  A `core` package may not read a file,
+// and a GGUF's index cannot be read in one go: nothing in the format
+// records where the metadata table ends.  A reader learns that only by
+// walking it — key, type tag, value, repeat, `metadata_kv_count` times
+// — and a value may be a 128,256-element array of strings.  So neither
+// "hand me the whole file" nor "hand me the first N bytes" is a
+// contract a caller can keep in advance.
+//
+// So the reader asks:
+//
+//   var r = ggufread.reader()
+//   loop
+//       if ggufread.is_done(r)
+//           break
+//       let want = ggufread.need(r)          // a GgufRange
+//       r = ggufread.offer(r, host_read(want))!
+//   let ix = ggufread.index_of(r)!
+//
+// `docs/publishing.md` § How a `core` package takes bytes from its host
+// calls this "the core asks, the host performs", and lists it as the
+// right shape for an indexed format.  Four functions, and the host's
+// loop is the six lines above whether the host is an mmap, a file
+// descriptor, an HTTP range request against a model repository, or a
+// device reading external flash.
+//
+// THE READER NEVER HOLDS THE FILE.  It holds the header, the entries it
+// has parsed, and the position it is at.  A 40 GB checkpoint is read
+// through this in a few hundred kilobytes of asks, because the only
+// bytes it ever sees are the index — and the index is the first
+// fraction of a per cent of the file.
+//
+// THE TWO CONVENIENCES, AND WHY THEY DO NOT REPLACE IT.
+//
+//   - `parse_index` takes the whole file and never asks for anything.
+//     Right when the caller has already mapped it.
+//   - `read_index<S: Read[e]>` writes the pump once, for the caller
+//     whose source is sequential.  The bound binds `Read`'s effect
+//     parameter and the clause uses it (SPEC § 5.6), so the row means
+//     "whatever the impl behind `S` supplies" — `[io]` for a file,
+//     `[io, net]` for a socket, nothing for an in-memory buffer — and
+//     the package stays `core`.
+//
+// Neither replaces the machine: a caller with random access wants to
+// ask for ranges rather than stream a gigabyte to find a tensor at the
+// end, and a caller that cannot give up its own event loop still needs
+// to drive the reader a step at a time.
+//
+// WHAT THE READER DOES NOT DO: it does not read tensor DATA.  It stops
+// at the end of the tensor-info table and answers a `GgufIndex`, and
+// every tensor's bytes are a `GgufRange` the caller reads itself.  That
+// is the whole point of the package, and the reason it is under a
+// megabyte of work to open a model that is forty thousand times that.
+
+// Everything a GGUF says about itself, with none of its weights.
+//
+// The value `read_index`, `parse_index` and `index_of` all answer, and
+// the one a loader keeps: from here `ggufinfo.tensor_range` gives the
+// bytes of any tensor, and `ggufmeta` gives every hyperparameter.
+pub struct GgufIndex
+    // The version, the two counts and the byte order.
+    header: GgufHeader
+    // The metadata table, in file order.
+    meta: GgufMeta
+    // The tensor-info table, in file order.  `ggufinfo.by_offset` is
+    // the order to read them in.
+    tensors: [GgufTensorInfo]
+    // The file's alignment: `general.alignment`, or 32.  Resolved here
+    // rather than left to the caller because every tensor range
+    // depends on it and a caller that forgot would compute offsets
+    // that are right for small files and wrong for large ones.
+    alignment: Int
+    // Where the data blob starts, counted from byte 0: the end of the
+    // tensor-info table rounded up to `alignment`.  The number
+    // `ggufinfo.tensor_range` takes.
+    data_at: Int
+
+// A reader positioned at byte 0 of a file it has not seen.
+//
+// ```novo
+// use ggufread
+//
+// fn main() [io]
+//     let r = ggufread.reader()
+//     println("${ggufread.need(r).len}")
+// ```
+pub fn reader() -> GgufReader
+    todo("gguf-nv.ggufread.reader")
+
+// The reader's state: what it has parsed and where it is.
+//
+// The fields are public because a tool reporting progress on a slow
+// read wants them, and because a type whose whole content is hidden
+// behind accessors is a type a reader of this package cannot check the
+// arithmetic of.  Nothing here is a handle and nothing is shared: a
+// `GgufReader` is a value, copying one is free, and a caller that wants
+// to retry a step from before an ask keeps the earlier copy.
+pub struct GgufReader
+    // 0 the header, 1 the metadata table, 2 the tensor-info table,
+    // 3 done.  `stage_name` is the word for it.
+    stage: Int
+    // The range the reader wants next, and the one `need` answers
+    // with.  Empty when the reader is done.
+    want: GgufRange
+    // The header, once it has been read.
+    header: ?GgufHeader
+    // The metadata entries parsed so far, in file order.
+    entries: [GgufKv]
+    // The tensor-info entries parsed so far, in file order.
+    tensors: [GgufTensorInfo]
+    // The file's alignment, resolved once the metadata table is
+    // complete.  `ggufhdr.default_alignment` until then.
+    alignment: Int
+
+// The range the host must read and hand back.
+//
+// Never overlaps what has already been offered and never goes
+// backwards, so a host reading a pipe can serve it as sequential reads
+// and a host reading a file can serve it as one `pread`.  The empty
+// range when the reader is done.
+pub fn need(r: GgufReader) -> GgufRange
+    todo("gguf-nv.ggufread.need")
+
+// Answer the ask, and get the reader that has taken it in.
+//
+// `chunk` must be exactly the bytes `need` asked for.  A short chunk is
+// `GgufTruncated` rather than a partial parse: a host that read fewer
+// bytes than it asked for has hit the end of the file, and a reader
+// that carried on would be reading the tensor-info table out of
+// whatever the host's buffer held last.
+//
+// A chunk LONGER than the ask is refused for the same reason — the
+// extra bytes have no position the reader can trust, and a host that
+// over-reads should trim rather than have this package guess where the
+// trim was.
+pub fn offer(r: GgufReader, chunk: Bytes) -> Result<GgufReader, GgufFault>
+    todo("gguf-nv.ggufread.offer")
+
+// Whether the index is complete.
+pub fn is_done(r: GgufReader) -> Bool
+    todo("gguf-nv.ggufread.is_done")
+
+// Which stage the reader is in, as a word: "header", "metadata",
+// "tensors" or "done".
+//
+// For a progress line.  `entries_seen` and `tensors_seen` are the
+// numbers beside it.
+pub fn stage_name(r: GgufReader) -> Str
+    todo("gguf-nv.ggufread.stage_name")
+
+// How many metadata entries have been parsed.
+pub fn entries_seen(r: GgufReader) -> Int
+    todo("gguf-nv.ggufread.entries_seen")
+
+// How many tensor-info entries have been parsed.
+pub fn tensors_seen(r: GgufReader) -> Int
+    todo("gguf-nv.ggufread.tensors_seen")
+
+// The index, once the reader is done.
+//
+// `GgufTruncated` at the position the reader stopped when it is not:
+// there is no half-index worth handing over, and a caller that asked
+// early has a bug in its loop rather than a partial answer.
+pub fn index_of(r: GgufReader) -> Result<GgufIndex, GgufFault>
+    todo("gguf-nv.ggufread.index_of")
+
+// The index out of a file the caller already holds entirely.
+//
+// For an mmap, a small model read into memory, or a test.  Does no
+// asking at all — it is `reader`, `need`, `offer` and `index_of` with
+// the host loop written as a slice, which is why it is here and not in
+// every caller.
+//
+// ```novo
+// use ggufread
+// use std.bytes
+//
+// fn main() [io]
+//     match ggufread.parse_index(bytes.zeros(0))
+//         Ok(ix) => println("${ix.header.tensor_count} tensor(s)")
+//         Err(f) => println(f.message())
+// ```
+pub fn parse_index(image: Bytes) -> Result<GgufIndex, GgufFault>
+    todo("gguf-nv.ggufread.parse_index")
+
+// The index read from the front of a sequential source.
+//
+// The header and both tables are contiguous from byte 0, so a source
+// that can only go forwards is enough to read all of them — and a
+// loader really does open a file, read the index, and only then seek.
+// This is that, with the pump written once.
+//
+// The bound binds `Read`'s effect parameter and the clause uses it, so
+// this function costs whatever the impl behind `S` supplies and the
+// package's budget is untouched.  It is the only effect row in
+// gguf-nv, and it spends nothing.
+//
+// Stops at the end of the tensor-info table and leaves the source
+// positioned there, so the caller's next read is the padding before
+// the data blob — `GgufIndex.data_at` says how much.
+pub fn read_index<S: Read[e]>(src: S) -> Result<GgufIndex, GgufFault> [e]
+    todo("gguf-nv.ggufread.read_index")
+
+// The whole index's byte range: from 0 to where the data blob starts.
+//
+// What a caller copying a model's index into a manifest reads, and
+// what `ggufwrite.index_bound` sizes a rewrite against.
+pub fn index_range(ix: GgufIndex) -> GgufRange
+    todo("gguf-nv.ggufread.index_range")
+
+// A named tensor's bytes, as a range counted from byte 0.
+//
+// `ggufinfo.find` and `ggufinfo.tensor_range` in one call, because
+// together they are what every caller of this package does.
+// `GgufKeyNotFound` with the tensor's name when there is no such
+// tensor — the same fault as a missing metadata key, because to a
+// caller the two failures are the same sentence.
+//
+// ```novo
+// use ggufread
+// use std.bytes
+//
+// fn main() [io]
+//     match ggufread.parse_index(bytes.zeros(0))
+//         Err(f)  => println(f.message())
+//         Ok(ix)  =>
+//             match ggufread.tensor_range(ix, "token_embd.weight")
+//                 Ok(r)  => println("${r.len} bytes at ${r.at}")
+//                 Err(f) => println(f.message())
+// ```
+pub fn tensor_range(ix: GgufIndex, name: Str) -> Result<GgufRange, GgufFault>
+    todo("gguf-nv.ggufread.tensor_range")
+
+// The data blob's range, given the file's total length.
+//
+// `data_at` to the end of the file.  Pass -1 for a length that is not
+// known and get the range from `data_at` with a length of -1, which
+// `ggufrange.range_fits` then refuses against any total — a caller
+// streaming a download gets an answer it cannot accidentally treat as
+// a bound.
+pub fn data_range(ix: GgufIndex, total: Int) -> GgufRange
+    todo("gguf-nv.ggufread.data_range")
+
+// Check the index against itself, and answer how many bytes the data
+// blob accounts for.
+//
+// `ggufinfo.check_layout` with the index's own alignment filled in,
+// and the call a loader should make once before it trusts a single
+// range.  Pass the file's total length, or -1 when it is not known.
+pub fn check_index(ix: GgufIndex, total: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufread.check_index")

@@ -1,0 +1,219 @@
+// ggufinfo.nv — the tensor-info table: a name, up to four dimensions, a
+// GGML type and an offset, per tensor, and the byte range each of them
+// works out to.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE OFFSET ON THE ENTRY IS RELATIVE AND THE RANGE IS ABSOLUTE, and
+// that asymmetry is deliberate.  The file stores an offset counted from
+// the start of the DATA BLOB, and `GgufTensorInfo.offset` keeps it that
+// way so that a round trip through `ggufwrite` writes back the number
+// that was read.  Every function here that answers a POSITION takes the
+// blob's own start and returns a `GgufRange` counted from byte 0,
+// because that is the number a caller passes to a read.
+//
+// Keeping both and naming which is which is the whole of it.  A reader
+// that mixed them is a reader whose first tensor is correct — the blob
+// usually starts early enough that the mistake is small — and whose
+// last one is megabytes wrong.
+//
+// DIMENSIONS ARE ROW-FIRST, WHICH IS THE REVERSE OF WHAT A PYTORCH
+// READER EXPECTS.  `dims[0]` is the fastest-varying axis: the row
+// length, the one a quantisation block runs along.  A 4096 by 11008
+// feed-forward weight is `[4096, 11008]` here and `(11008, 4096)` in a
+// state dict, and the two round differently under a 256-weight block,
+// so a size computed from the wrong order is not merely transposed —
+// it is a different number of bytes.
+//
+// NOTHING IN THE FORMAT CHECKS THE TABLE AGAINST ITSELF.  Two tensors
+// may claim the same bytes, a tensor may claim bytes past the end of
+// the file, and a quantiser that got its arithmetic wrong produces
+// exactly that.  `check_layout` is the pass that says so, and it is a
+// separate call rather than part of parsing because a tool repairing a
+// damaged checkpoint needs to read the table before it can be told the
+// table is wrong.
+
+// One entry of the tensor-info table.
+//
+// ```novo
+// use ggufinfo
+//
+// fn main() [io]
+//     let t = GgufTensorInfo { name: "token_embd.weight",
+//                              dims: [4096, 32000],
+//                              kind: GgufQ4_K,
+//                              offset: 0 }
+//     println("${ggufinfo.element_count(t)}")
+// ```
+pub struct GgufTensorInfo
+    // The tensor's name, as UTF-8.  GGML's own convention:
+    // `token_embd.weight`, `blk.<n>.attn_q.weight`, `output_norm.weight`.
+    name: Str
+    // The extents, fastest-varying first — see the module comment.
+    // Between one and `max_rank` of them.
+    dims: [Int]
+    // Which GGML type the bytes are in.  Per tensor, not per file: a
+    // mixed quantisation gives the attention weights one type and the
+    // embedding another, and `general.file_type` names only what the
+    // quantiser was asked for.
+    kind: GgufType
+    // Byte offset from the start of the DATA BLOB, not from the start
+    // of the file.  A multiple of the file's alignment.
+    offset: Int
+
+// The most dimensions a tensor may declare: 4.
+//
+// GGML's own limit, and not a soft one — the tensor-info entry writes
+// exactly `rank` dimensions after a rank field, and every consumer of
+// the format allocates four.
+pub fn max_rank() -> Int
+    todo("gguf-nv.ggufinfo.max_rank")
+
+// How many dimensions this tensor declares.
+pub fn rank(info: GgufTensorInfo) -> Int
+    todo("gguf-nv.ggufinfo.rank")
+
+// How many weights the tensor holds: the product of its dimensions.
+//
+// `GgufUnsignedOverflow` is not raised here — a product that does not
+// fit is caught by `validate`, which is where a caller is asking the
+// question in earnest.  This one is for a summary line.
+pub fn element_count(info: GgufTensorInfo) -> Int
+    todo("gguf-nv.ggufinfo.element_count")
+
+// The row length: `dims[0]`, the axis quantisation blocks run along.
+//
+// The number that must be a multiple of `ggufquant.block_elements`.
+pub fn row_elements(info: GgufTensorInfo) -> Int
+    todo("gguf-nv.ggufinfo.row_elements")
+
+// How many rows the tensor has: the product of every dimension but the
+// first.
+//
+// 1 for a rank-1 tensor, which is what a norm weight and a bias are.
+pub fn row_count(info: GgufTensorInfo) -> Int
+    todo("gguf-nv.ggufinfo.row_count")
+
+// How many bytes the tensor's data occupies.
+//
+// `ggufquant.tensor_bytes` with the entry's own name and type filled
+// in, which is the form every caller wants.
+pub fn tensor_bytes(info: GgufTensorInfo) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufinfo.tensor_bytes")
+
+// The tensor's bytes, as a range counted from byte 0 of the file.
+//
+// `data_at` is where the data blob starts — `ggufread.GgufIndex`
+// carries it, and `ggufhdr.align_up` is what computed it.  This is the
+// call a loader makes per tensor, and the answer is what it hands to a
+// read, an mmap window or an upload queue.
+//
+// ```novo
+// use ggufinfo
+//
+// fn main() [io]
+//     let t = GgufTensorInfo { name: "output_norm.weight",
+//                              dims: [4096], kind: GgufF32, offset: 0 }
+//     match ggufinfo.tensor_range(t, 4096)
+//         Ok(r)  => println("${r.len} bytes at ${r.at}")
+//         Err(f) => println(f.message())
+// ```
+pub fn tensor_range(info: GgufTensorInfo, data_at: Int) -> Result<GgufRange, GgufFault>
+    todo("gguf-nv.ggufinfo.tensor_range")
+
+// One row's bytes, as a range counted from byte 0 of the file.
+//
+// For a caller that wants a matrix a row at a time: an mmap that
+// touches one page rather than nine megabytes, or a device that
+// uploads a weight matrix in pieces it has room for.  The row index is
+// counted over `row_count` rows.
+pub fn row_range(info: GgufTensorInfo, data_at: Int, row: Int) -> Result<GgufRange, GgufFault>
+    todo("gguf-nv.ggufinfo.row_range")
+
+// How many bytes this entry occupies in the tensor-info TABLE — the
+// name's length field, the name, the rank, the dimensions, the type and
+// the offset.
+//
+// Depends on the version, because the name's length field and each
+// dimension are four bytes in version 1 and eight in 2 and 3.  What
+// `ggufwrite.index_bound` sums, and what `ggufread` steps by.
+pub fn entry_bytes(info: GgufTensorInfo, version: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufinfo.entry_bytes")
+
+// Check one entry against the format's rules, and answer how many
+// bytes its data occupies.
+//
+// Four rules, and each has its own fault so that a message names the
+// one that was broken: the rank is between 1 and `max_rank`
+// (`GgufBadRank`), no dimension is negative (`GgufBadRank` as well —
+// a rank-2 tensor with a dimension of -1 is a rank the writer got
+// wrong, not a shape), the row length is a whole number of blocks
+// (`GgufRaggedRow`), and the offset is a multiple of the alignment
+// (`GgufMisalignedTensor`).
+pub fn validate(info: GgufTensorInfo, alignment: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufinfo.validate")
+
+// The entry with this name, or `None`.
+//
+// A walk.  A loader asking for two hundred tensors by name out of a
+// table of two hundred is doing forty thousand comparisons, which is
+// nothing next to reading the tensors — but a caller that finds
+// otherwise sorts once with `by_offset` and walks in step.
+pub fn find(infos: [GgufTensorInfo], name: Str) -> ?GgufTensorInfo
+    todo("gguf-nv.ggufinfo.find")
+
+// Every tensor's name, in table order.
+pub fn names(infos: [GgufTensorInfo]) -> [Str]
+    todo("gguf-nv.ggufinfo.names")
+
+// The entries ordered by their offset.
+//
+// The order to READ them in.  The table's own order is the order the
+// quantiser wrote the entries, which is usually but not always the
+// order the data is in, and a loader that walks the table on a
+// spinning disk or a network filesystem and gets it wrong pays for
+// every seek.
+pub fn by_offset(infos: [GgufTensorInfo]) -> [GgufTensorInfo]
+    todo("gguf-nv.ggufinfo.by_offset")
+
+// The tensors whose names start with this prefix, in table order.
+//
+// `with_prefix(infos, "blk.0.")` is one transformer layer, which is
+// the unit a loader that streams layer by layer works in.
+pub fn with_prefix(infos: [GgufTensorInfo], prefix: Str) -> [GgufTensorInfo]
+    todo("gguf-nv.ggufinfo.with_prefix")
+
+// How many bytes the whole data blob needs: the end of the
+// furthest-reaching tensor, rounded up to the alignment.
+//
+// Not the sum of the tensors — a file may have padding between them,
+// and every K-quant file does at the boundaries where a tensor's byte
+// count is not a multiple of 32.
+pub fn data_bytes(infos: [GgufTensorInfo], alignment: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufinfo.data_bytes")
+
+// Check the whole table against itself and against the file's size, and
+// answer how many bytes of data blob it accounts for.
+//
+// `validate` on each entry, then two checks no single entry can make:
+// no two tensors' ranges overlap (`GgufMisalignedTensor` names the
+// second of the pair, because the first is the one that was placed
+// correctly), and no tensor reaches past `blob_bytes`
+// (`GgufTruncated`).
+//
+// `blob_bytes` is the file's length minus where the blob starts.  Pass
+// -1 for a caller that does not know the file's length — a stream, a
+// partial download — and the past-the-end check is skipped while the
+// overlap check still runs.
+pub fn check_layout(infos: [GgufTensorInfo], alignment: Int,
+                    blob_bytes: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufinfo.check_layout")
+
+// How many of each type the table holds, as name/count pairs in the
+// order `ggufquant.known_types` gives.
+//
+// What a `gguf dump` prints under the heading that tells a reader
+// their "Q4_K_M" file is four different quantisations — which it is,
+// and which is why `general.file_type` is a hint.
+pub fn type_histogram(infos: [GgufTensorInfo]) -> [(Str, Int)]
+    todo("gguf-nv.ggufinfo.type_histogram")

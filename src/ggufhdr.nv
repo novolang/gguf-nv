@@ -1,0 +1,230 @@
+// ggufhdr.nv — the twenty-four bytes at the front of a model file, and
+// the two facts they settle: which version wrote it, and which way
+// round its numbers are.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE MAGIC IS NOT WHAT DETECTS THE BYTE ORDER, AND THIS IS THE ONE
+// THING A GGUF READER GETS WRONG.  The four bytes are `47 47 55 46` —
+// the ASCII `GGUF` — in file order, in a little-endian file and in a
+// big-endian one alike, because they are written as characters rather
+// than as a number.  So a reader that swapped them to decide the byte
+// order would decide nothing at all.
+//
+// The VERSION field is what decides it.  It is the next four bytes, it
+// is a small number, and a small number read the wrong way round has
+// its low sixteen bits zero: version 3 read backwards is 0x03000000.
+// `detect_order` is that test and nothing else, and it is the same test
+// the reference implementation's own reader makes.
+//
+// THE HEADER IS TWO SIZES.  Version 1 wrote the two counts as 32-bit,
+// and versions 2 and 3 write them as 64-bit — so the header is 16
+// bytes or 24, and the same widening applies to every string length and
+// every array length in the tables that follow.  `count_width` is that
+// one fact, read by the header, by `ggufval` and by `ggufwrite`, so
+// that no module carries its own copy of it.
+//
+// Version 1 files are read and never written: `ggufwrite` emits the
+// latest version, because a tool writing a GGUF in 2026 that chose the
+// narrow counts would be choosing a four-billion-tensor limit for
+// nothing.
+
+// Which way round the numbers in this file are.
+//
+// A GGUF is little-endian unless it says otherwise, and almost every
+// checkpoint in the world is; the big-endian form exists for s390x, it
+// is version 3 or later, and it is the reason a reader cannot simply
+// read four bytes as an integer and get on with it.
+//
+// ```novo
+// use ggufhdr
+//
+// fn main() [io]
+//     println(ggufhdr.order_name(GgufLittleEndian))
+//     // : little-endian
+// ```
+pub enum GgufByteOrder
+    // Every multi-byte field has its least significant byte first.
+    GgufLittleEndian
+    // Every multi-byte field has its most significant byte first.
+    // Version 3 and later only, and the magic is STILL the four
+    // characters in the same order — see the module comment.
+    GgufBigEndian
+
+// The header's four fields, with the byte order as a fifth fact the
+// bytes themselves implied.
+//
+// `tensor_count` and `metadata_count` are what the two tables that
+// follow declare, and they are the only bound on how long the walk is:
+// nothing in the format records where the metadata table ENDS, so a
+// reader counts entries rather than bytes and stops after this many.
+pub struct GgufHeader
+    // 1, 2 or 3.  `supported_versions` is the list.
+    version: Int
+    // How many entries the tensor-info table holds.  May be zero: a
+    // GGUF carrying only a tokenizer is a real file and llama.cpp
+    // writes them.
+    tensor_count: Int
+    // How many entries the metadata table holds.  A model with none
+    // is legal and useless, and this reader reads it.
+    metadata_count: Int
+    // Which way round every number after these four bytes is.
+    order: GgufByteOrder
+
+// The four bytes at offset 0, as characters: `GGUF`.
+//
+// A writer emits exactly these, in this order, whichever byte order it
+// is writing the rest of the file in.
+//
+// ```novo
+// use ggufhdr
+// use std.bytes
+//
+// fn main() [io]
+//     println("${bytes.len(ggufhdr.magic_bytes())}")
+//     // : 4
+// ```
+pub fn magic_bytes() -> Bytes
+    todo("gguf-nv.ggufhdr.magic_bytes")
+
+// The same four bytes read as a little-endian 32-bit integer:
+// 0x46554747, which is 1179993927.
+//
+// The number `GgufBadMagic` carries, so that a reader who meets a
+// safetensors file or a zip sees the number their own header starts
+// with and recognises it.
+pub fn magic_le() -> Int
+    todo("gguf-nv.ggufhdr.magic_le")
+
+// The range of the magic: four bytes at 0.
+pub fn magic_range() -> GgufRange
+    todo("gguf-nv.ggufhdr.magic_range")
+
+// The range of the version field: four bytes at 4.
+//
+// Separate from the magic because the two answer different questions
+// and a caller probing a directory of files wants the first one only —
+// eight bytes per file tells it what is a GGUF, and reading the second
+// four tells it what it will cost to read the rest.
+pub fn version_range() -> GgufRange
+    todo("gguf-nv.ggufhdr.version_range")
+
+// The one read that always answers: twenty-four bytes at 0.
+//
+// Version 1's header is sixteen, so this asks for eight bytes it may
+// not need.  It asks anyway, because a caller doing its own reads would
+// otherwise have to make two round trips to a disk or a network to
+// learn a number it could have had in the first — and twenty-four bytes
+// is smaller than any read a storage device actually performs.
+pub fn probe_range() -> GgufRange
+    todo("gguf-nv.ggufhdr.probe_range")
+
+// Read the header out of the file's first bytes.
+//
+// Wants at least `header_bytes(version)` of them and takes
+// `probe_range`'s twenty-four happily.  `GgufBadMagic` when the four
+// characters are not there, `GgufUnsupportedVersion` when the version
+// is not 1, 2 or 3, and `GgufTruncated` when there are not enough bytes
+// to read the counts the version implies.
+//
+// ```novo
+// use ggufhdr
+// use std.bytes
+//
+// fn main() [io]
+//     match ggufhdr.parse_header(bytes.zeros(24))
+//         Ok(h)  => println("v${h.version}")
+//         Err(f) => println(f.message())
+// ```
+pub fn parse_header(head: Bytes) -> Result<GgufHeader, GgufFault>
+    todo("gguf-nv.ggufhdr.parse_header")
+
+// Whether these bytes start with the magic.
+//
+// Four bytes is enough, and this is the call a file-type sniffer makes:
+// it does not care about the version, it cares whether to hand the path
+// to a GGUF loader or to a safetensors one.
+pub fn is_gguf(head: Bytes) -> Bool
+    todo("gguf-nv.ggufhdr.is_gguf")
+
+// Which way round the file is, from the version field read as
+// little-endian.
+//
+// The whole of the test: a version whose low sixteen bits are zero was
+// read the wrong way round, because no real version number is a
+// multiple of 65536.  `GgufBigEndian` for those, `GgufLittleEndian` for
+// everything else — including 0, which is not a version and is caught
+// by `parse_header` rather than here.
+//
+// ```novo
+// use ggufhdr
+//
+// fn main() [io]
+//     println(ggufhdr.order_name(ggufhdr.detect_order(50331648)))
+//     // : big-endian
+// ```
+pub fn detect_order(version_le: Int) -> GgufByteOrder
+    todo("gguf-nv.ggufhdr.detect_order")
+
+// "little-endian" or "big-endian", for a message.
+pub fn order_name(o: GgufByteOrder) -> Str
+    todo("gguf-nv.ggufhdr.order_name")
+
+// The versions this reader reads: 1, 2 and 3.
+//
+// A list rather than a range, because the next version GGML publishes
+// will not necessarily be 4 and a reader that assumed a range would
+// read a version 5 file with version 3's field widths and produce
+// offsets that are wrong by a table.
+pub fn supported_versions() -> [Int]
+    todo("gguf-nv.ggufhdr.supported_versions")
+
+// The version `ggufwrite` emits: 3.
+pub fn latest_version() -> Int
+    todo("gguf-nv.ggufhdr.latest_version")
+
+// How many bytes a count field occupies in this version: 4 for version
+// 1, 8 for 2 and 3.
+//
+// The same width applies to every string length and every array length
+// in the two tables, which is why this lives here and `ggufval` calls
+// it rather than repeating the rule.
+pub fn count_width(version: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufhdr.count_width")
+
+// The whole header's size: 16 for version 1, 24 for 2 and 3.
+pub fn header_bytes(version: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufhdr.header_bytes")
+
+// The header's own range, which is `header_bytes` at 0.
+pub fn header_range(version: Int) -> Result<GgufRange, GgufFault>
+    todo("gguf-nv.ggufhdr.header_range")
+
+// The alignment a file that says nothing uses: 32.
+//
+// `general.alignment` overrides it, and `ggufmeta.alignment` is the
+// call that applies the default.  The number matters because every
+// tensor offset in the file is a multiple of it and the data blob
+// starts at the first multiple of it after the tensor-info table.
+pub fn default_alignment() -> Int
+    todo("gguf-nv.ggufhdr.default_alignment")
+
+// Whether an alignment is one a file may declare: a positive power of
+// two.
+//
+// Zero and negatives are refused for the obvious reason; a
+// non-power-of-two is refused because `align_up` is a mask in every
+// implementation of this format and a file that needed a division
+// would load differently in llama.cpp than here.
+pub fn alignment_is_valid(alignment: Int) -> Bool
+    todo("gguf-nv.ggufhdr.alignment_is_valid")
+
+// The first multiple of `alignment` at or after `offset`.
+//
+// Where the data blob starts, given where the tensor-info table ended.
+// `GgufBadAlignment` rather than a silent pass-through when the
+// alignment is not a power of two, because an offset computed from a
+// bad alignment is the kind of wrong that shows up as a garbled
+// generation rather than as an error.
+pub fn align_up(offset: Int, alignment: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufhdr.align_up")

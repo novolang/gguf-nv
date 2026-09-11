@@ -1,0 +1,329 @@
+// ggufquant_tests.nv — the API suite for the block layouts: the type
+// codes, how many weights a block holds, how many bytes that block
+// occupies, and the row arithmetic built on the two.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: gguf-nv.<module>.<fn>`.
+//
+// WHERE THE NUMBERS COME FROM.  `ggml-common.h`, one block struct per
+// type, and each assertion below writes the sum it is: `block_q4_K` is
+// `ggml_half d` plus `ggml_half dmin` plus `uint8_t scales[12]` plus
+// `uint8_t qs[128]`, which is 2 + 2 + 12 + 128 = 144.  The sums are
+// written out rather than quoted as totals so that a reader can check
+// them without the header, and so that a wrong one is visible as a
+// wrong ADDITION rather than as a number that looks as plausible as
+// any other.
+//
+// THE REFERENCE IMPLEMENTATION IS THE ORACLE, and it arrives beside
+// this file as a generated run when the bodies land: `gguf-py`'s own
+// reader over a corpus of real checkpoints, every tensor's size
+// compared with what `ggufquant.tensor_bytes` computes for it.  The
+// numbers here are read off the struct definitions, and this suite says
+// so rather than implying a provenance it does not have.
+
+use std.test
+use ggufquant
+use gguferr
+
+@test
+fn test_the_unquantised_types_are_one_weight_and_their_own_width() [io]
+    test.case("a block of an unquantised type is one weight")
+    test.assert(ggufquant.block_elements(GgufF32) == 1)
+    test.assert(ggufquant.block_elements(GgufF16) == 1)
+    test.assert(ggufquant.block_elements(GgufBF16) == 1)
+    test.assert(ggufquant.block_elements(GgufF64) == 1)
+
+    test.case("and its bytes are the scalar's width")
+    test.assert(ggufquant.block_bytes(GgufF32) == 4)
+    test.assert(ggufquant.block_bytes(GgufF16) == 2)
+    test.assert(ggufquant.block_bytes(GgufBF16) == 2)
+    test.assert(ggufquant.block_bytes(GgufF64) == 8)
+
+    test.case("BF16 and F16 are the same width and not the same type")
+    // Same two bytes, different exponent range.  A loader that treated
+    // one as the other produces infinities on the first large weight,
+    // which is why they are separate codes and separate variants.
+    test.assert(ggufquant.type_code(GgufF16) == 1)
+    test.assert(ggufquant.type_code(GgufBF16) == 30)
+
+    test.case("the integer types are values, not weights")
+    test.assert(ggufquant.block_bytes(GgufI8) == 1)
+    test.assert(ggufquant.block_bytes(GgufI16) == 2)
+    test.assert(ggufquant.block_bytes(GgufI32) == 4)
+    test.assert(ggufquant.block_bytes(GgufI64) == 8)
+    test.assert(ggufquant.is_quantized(GgufI32) == false)
+
+@test
+fn test_the_original_family_is_thirty_two_weights_at_a_time() [io]
+    test.case("every member of the Q4_0 family holds thirty-two")
+    test.assert(ggufquant.block_elements(GgufQ4_0) == 32)
+    test.assert(ggufquant.block_elements(GgufQ4_1) == 32)
+    test.assert(ggufquant.block_elements(GgufQ5_0) == 32)
+    test.assert(ggufquant.block_elements(GgufQ5_1) == 32)
+    test.assert(ggufquant.block_elements(GgufQ8_0) == 32)
+    test.assert(ggufquant.block_elements(GgufQ8_1) == 32)
+
+    test.case("Q4_0 is a half scale and sixteen packed nibbles")
+    // 2 + 16 = 18
+    test.assert(ggufquant.block_bytes(GgufQ4_0) == 18)
+
+    test.case("Q4_1 adds a half minimum")
+    // 2 + 2 + 16 = 20
+    test.assert(ggufquant.block_bytes(GgufQ4_1) == 20)
+
+    test.case("Q5_0 adds a four-byte plane of fifth bits")
+    // 2 + 4 + 16 = 22
+    test.assert(ggufquant.block_bytes(GgufQ5_0) == 22)
+
+    test.case("Q5_1 has both")
+    // 2 + 2 + 4 + 16 = 24
+    test.assert(ggufquant.block_bytes(GgufQ5_1) == 24)
+
+    test.case("Q8_0 is a half scale and one signed byte each")
+    // 2 + 32 = 34
+    test.assert(ggufquant.block_bytes(GgufQ8_0) == 34)
+
+    test.case("Q8_1 adds the sum a Q4_1 dot product needs")
+    // 2 + 2 + 32 = 36
+    test.assert(ggufquant.block_bytes(GgufQ8_1) == 36)
+
+    test.case("IQ4_NL is Q4_0's size with a codebook instead of a step")
+    // 2 + 16 = 18, the same as Q4_0 and a different decode entirely.
+    test.assert(ggufquant.block_elements(GgufIQ4_NL) == 32)
+    test.assert(ggufquant.block_bytes(GgufIQ4_NL) == 18)
+
+@test
+fn test_the_k_quants_are_a_superblock_of_two_hundred_and_fifty_six() [io]
+    test.case("every K-quant holds two hundred and fifty-six")
+    test.assert(ggufquant.block_elements(GgufQ2_K) == 256)
+    test.assert(ggufquant.block_elements(GgufQ3_K) == 256)
+    test.assert(ggufquant.block_elements(GgufQ4_K) == 256)
+    test.assert(ggufquant.block_elements(GgufQ5_K) == 256)
+    test.assert(ggufquant.block_elements(GgufQ6_K) == 256)
+    test.assert(ggufquant.block_elements(GgufQ8_K) == 256)
+
+    test.case("Q2_K: sixteen scale bytes, sixty-four of quants, two halves")
+    // 16 + 64 + 2 + 2 = 84
+    test.assert(ggufquant.block_bytes(GgufQ2_K) == 84)
+
+    test.case("Q3_K: a mask, the quants, twelve scale bytes and a half")
+    // 32 + 64 + 12 + 2 = 110
+    test.assert(ggufquant.block_bytes(GgufQ3_K) == 110)
+
+    test.case("Q4_K: two halves, twelve scale bytes, a hundred and twenty-eight of nibbles")
+    // 2 + 2 + 12 + 128 = 144
+    test.assert(ggufquant.block_bytes(GgufQ4_K) == 144)
+
+    test.case("Q5_K: Q4_K plus a thirty-two byte plane of fifth bits")
+    // 2 + 2 + 12 + 32 + 128 = 176
+    test.assert(ggufquant.block_bytes(GgufQ5_K) == 176)
+
+    test.case("Q6_K: a low plane, a high plane, sixteen signed scales, a half")
+    // 128 + 64 + 16 + 2 = 210
+    test.assert(ggufquant.block_bytes(GgufQ6_K) == 210)
+
+    test.case("Q8_K: a float scale, a signed byte each, sixteen sums")
+    // 4 + 256 + 32 = 292
+    test.assert(ggufquant.block_bytes(GgufQ8_K) == 292)
+
+    test.case("and the family answers is_k_quant and nothing else does")
+    test.assert(ggufquant.is_k_quant(GgufQ4_K))
+    test.assert(ggufquant.is_k_quant(GgufQ8_K))
+    test.assert(ggufquant.is_k_quant(GgufQ4_0) == false)
+    test.assert(ggufquant.is_k_quant(GgufIQ4_XS) == false)
+
+@test
+fn test_the_iq_family_and_the_ternary_types() [io]
+    test.case("the IQ types are superblocks too")
+    test.assert(ggufquant.block_elements(GgufIQ2_XXS) == 256)
+    test.assert(ggufquant.block_elements(GgufIQ1_M) == 256)
+    test.assert(ggufquant.block_elements(GgufIQ4_XS) == 256)
+
+    test.case("IQ2_XXS: a half and thirty-two sixteen-bit indices")
+    // 2 + 64 = 66
+    test.assert(ggufquant.block_bytes(GgufIQ2_XXS) == 66)
+
+    test.case("IQ2_XS adds eight scale bytes")
+    // 2 + 64 + 8 = 74
+    test.assert(ggufquant.block_bytes(GgufIQ2_XS) == 74)
+
+    test.case("IQ2_S: a half, sixty-four quants, eight high bits, eight scales")
+    // 2 + 64 + 8 + 8 = 82
+    test.assert(ggufquant.block_bytes(GgufIQ2_S) == 82)
+
+    test.case("IQ3_XXS: a half and three bytes per eight weights")
+    // 2 + 96 = 98
+    test.assert(ggufquant.block_bytes(GgufIQ3_XXS) == 98)
+
+    test.case("IQ3_S is Q3_K's size and a different layout")
+    // 2 + 64 + 8 + 32 + 4 = 110, and Q3_K is 110 as well — which is
+    // why `type_of_code` is the only way to tell them apart and a
+    // reader that dispatched on size would be wrong here and nowhere
+    // else.
+    test.assert(ggufquant.block_bytes(GgufIQ3_S) == 110)
+    test.assert(ggufquant.block_bytes(GgufQ3_K) == ggufquant.block_bytes(GgufIQ3_S))
+    test.assert(ggufquant.type_code(GgufIQ3_S) == 21)
+    test.assert(ggufquant.type_code(GgufQ3_K) == 11)
+
+    test.case("IQ1_S: a half, thirty-two quants, sixteen bits of high")
+    // 2 + 32 + 16 = 50
+    test.assert(ggufquant.block_bytes(GgufIQ1_S) == 50)
+
+    test.case("IQ1_M has no superblock scale field at all")
+    // 32 + 16 + 8 = 56, and the scale lives inside `scales`.
+    test.assert(ggufquant.block_bytes(GgufIQ1_M) == 56)
+
+    test.case("IQ4_XS: a half, a packed scale pair, four low, a hundred and twenty-eight")
+    // 2 + 2 + 4 + 128 = 136
+    test.assert(ggufquant.block_bytes(GgufIQ4_XS) == 136)
+
+    test.case("the ternary types are two hundred and fifty-six as well")
+    // TQ1_0: 48 + 4 + 2 = 54, five trits to a byte.
+    // TQ2_0: 64 + 2 = 66, two bits each.
+    test.assert(ggufquant.block_bytes(GgufTQ1_0) == 54)
+    test.assert(ggufquant.block_bytes(GgufTQ2_0) == 66)
+    test.assert(ggufquant.is_ternary(GgufTQ1_0))
+    test.assert(ggufquant.is_ternary(GgufQ2_K) == false)
+
+    test.case("and every IQ type says it needs a codebook the file does not carry")
+    test.assert(ggufquant.is_iq_type(GgufIQ2_XXS))
+    test.assert(ggufquant.is_iq_type(GgufIQ4_NL))
+    test.assert(ggufquant.is_iq_type(GgufQ4_K) == false)
+
+@test
+fn test_the_codes_are_the_formats_own_and_five_are_gone() [io]
+    test.case("the codes a reader dispatches on")
+    test.assert(ggufquant.type_code(GgufF32) == 0)
+    test.assert(ggufquant.type_code(GgufQ4_0) == 2)
+    test.assert(ggufquant.type_code(GgufQ8_0) == 8)
+    test.assert(ggufquant.type_code(GgufQ4_K) == 12)
+    test.assert(ggufquant.type_code(GgufQ6_K) == 14)
+    test.assert(ggufquant.type_code(GgufIQ2_XXS) == 16)
+    test.assert(ggufquant.type_code(GgufTQ2_0) == 35)
+
+    test.case("and the mapping goes both ways")
+    match ggufquant.type_of_code(12)
+        Ok(t)  => test.assert(ggufquant.type_name(t) == "Q4_K")
+        Err(f) => test.fail(f.message())
+
+    test.case("a code that was never a type is refused")
+    match ggufquant.type_of_code(99)
+        Ok(t)  => test.fail("99 named ${ggufquant.type_name(t)}")
+        Err(f) => test.assert(gguferr.fault_stage(f) == "tensors")
+
+    test.case("and so is a code that used to be one")
+    // 4 and 5 were Q4_2 and Q4_3; 31, 32 and 33 were the repacked
+    // Q4_0 variants.  All five are refused, and named.
+    test.assert(list.len(ggufquant.withdrawn_codes()) == 5)
+    match ggufquant.type_of_code(31)
+        Ok(t)  => test.fail("31 named ${ggufquant.type_name(t)}")
+        Err(f) => test.assert(f.message() != "")
+    match ggufquant.withdrawn_name(31)
+        Some(n) => test.assert(n == "Q4_0_4_4")
+        None    => test.fail("31 has no withdrawn name")
+    match ggufquant.withdrawn_name(4)
+        Some(n) => test.assert(n == "Q4_2")
+        None    => test.fail("4 has no withdrawn name")
+    match ggufquant.withdrawn_name(12)
+        Some(n) => test.fail("12 is current and named ${n}")
+        None    => test.assert(true)
+
+    test.case("the two runtime-only types are not file types")
+    test.assert(ggufquant.is_file_type(GgufQ8_K) == false)
+    test.assert(ggufquant.is_file_type(GgufQ8_1) == false)
+    test.assert(ggufquant.is_file_type(GgufQ4_K))
+
+    test.case("a name round-trips through the parser a command line uses")
+    match ggufquant.type_of_name("q4_k")
+        Some(t) => test.assert(ggufquant.type_code(t) == 12)
+        None    => test.fail("q4_k parsed as nothing")
+
+@test
+fn test_a_row_is_a_whole_number_of_blocks_or_it_is_not_a_row() [io]
+    test.case("a row of an unquantised type is any length at all")
+    match ggufquant.row_bytes(GgufF32, "output_norm.weight", 4096)
+        Ok(n)  => test.assert(n == 16384)
+        Err(f) => test.fail(f.message())
+
+    test.case("a Q4_K row of 4096 is sixteen blocks of a hundred and forty-four")
+    // 4096 / 256 = 16, and 16 * 144 = 2304.
+    match ggufquant.blocks_in_row(GgufQ4_K, "blk.0.attn_q.weight", 4096)
+        Ok(n)  => test.assert(n == 16)
+        Err(f) => test.fail(f.message())
+    match ggufquant.row_bytes(GgufQ4_K, "blk.0.attn_q.weight", 4096)
+        Ok(n)  => test.assert(n == 2304)
+        Err(f) => test.fail(f.message())
+
+    test.case("and a row that is not a whole number of blocks is refused")
+    match ggufquant.row_bytes(GgufQ4_K, "blk.0.attn_q.weight", 100)
+        Ok(n)  => test.fail("100 weights encoded in ${n} bytes")
+        Err(f) => test.assert(gguferr.is_corrupt(f))
+
+    test.case("a Q8_0 row of 100 is refused for the same reason")
+    // 100 is not a multiple of 32 either, and the fault names the
+    // block size so the message says 32 rather than 256.
+    match ggufquant.row_bytes(GgufQ8_0, "blk.0.ffn_up.weight", 100)
+        Ok(n)  => test.fail("100 weights encoded in ${n} bytes")
+        Err(f) => test.assert(f.message() != "")
+
+@test
+fn test_a_tensors_size_is_its_rows_and_the_first_dimension_is_the_row() [io]
+    test.case("a 4096 by 4096 Q4_K weight is 4096 rows of 2304 bytes")
+    // 4096 * 2304 = 9437184.  The number a loader that got the
+    // dimension order backwards would agree with by coincidence, and
+    // the next test is the one where it would not.
+    match ggufquant.tensor_bytes(GgufQ4_K, "blk.0.attn_q.weight", [4096, 4096])
+        Ok(n)  => test.assert(n == 9437184)
+        Err(f) => test.fail(f.message())
+
+    test.case("and the first dimension is the ROW, which a state dict prints last")
+    // 4096 wide by 11008 tall: 11008 rows of 16 blocks of 144 bytes,
+    // which is 11008 * 2304 = 25362432.  Reversed it would be 4096
+    // rows of 43 blocks — 11008 is not a multiple of 256 at all, so
+    // the reversed reading is not merely a different number, it is
+    // refused.
+    match ggufquant.tensor_bytes(GgufQ4_K, "blk.0.ffn_up.weight", [4096, 11008])
+        Ok(n)  => test.assert(n == 25362432)
+        Err(f) => test.fail(f.message())
+    match ggufquant.tensor_bytes(GgufQ4_K, "blk.0.ffn_up.weight", [11008, 4096])
+        Ok(n)  => test.fail("a ragged row sized at ${n}")
+        Err(f) => test.assert(gguferr.is_corrupt(f))
+
+    test.case("a rank-1 F32 tensor is one row")
+    match ggufquant.tensor_bytes(GgufF32, "blk.0.attn_norm.weight", [4096])
+        Ok(n)  => test.assert(n == 16384)
+        Err(f) => test.fail(f.message())
+
+    test.case("bits per weight is the reporting number and nothing computes with it")
+    // 144 bytes over 256 weights is 4.5 bits, which is what a model
+    // card means by "Q4_K".
+    test.assert(ggufquant.bits_per_weight(GgufQ4_K) == 4.5)
+    test.assert(ggufquant.bits_per_weight(GgufF32) == 32.0)
+
+@test
+fn test_a_block_range_is_how_a_tensor_is_read_in_pieces() [io]
+    test.case("block zero starts where the tensor's data starts")
+    match ggufquant.block_range(GgufQ6_K, 8192, 0)
+        Ok(r)  => test.assert(r.at == 8192 and r.len == 210)
+        Err(f) => test.fail(f.message())
+
+    test.case("and block n is n block-lengths further on")
+    match ggufquant.block_range(GgufQ6_K, 8192, 311)
+        Ok(r)  => test.assert(r.at == 8192 + 311 * 210 and r.len == 210)
+        Err(f) => test.fail(f.message())
+
+    test.case("a negative block index is not a position")
+    match ggufquant.block_range(GgufQ6_K, 8192, -1)
+        Ok(r)  => test.fail("a block at ${r.at}")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("every type this package knows answers every question in it")
+    // The guard against a variant added to the enum and forgotten in
+    // one of the tables: a block of no weights or no bytes is not a
+    // block, and a name that is empty is not a name.
+    let all = ggufquant.known_types()
+    test.assert(list.len(all) == 31)
+    for t in all
+        test.assert(ggufquant.block_elements(t) > 0)
+        test.assert(ggufquant.block_bytes(t) > 0)
+        test.assert(ggufquant.type_name(t) != "")

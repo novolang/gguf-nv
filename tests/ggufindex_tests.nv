@@ -1,0 +1,605 @@
+// ggufindex_tests.nv — the API suite for the index: the header and its
+// two field widths, the byte-order test, the thirteen metadata value
+// types, the architecture-scoped key names, the tensor-info table's
+// ranges, the request/range reader, and the writer's round trip.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: gguf-nv.<module>.<fn>`.
+//
+// WHERE THE NUMBERS COME FROM.  The GGUF specification, which fixes all
+// of it: the four-character magic, the version field, the two counts,
+// the thirteen value type codes in order, the string-as-length-and-bytes
+// encoding, the array's element type before its count, the tensor
+// entry's name/rank/dims/type/offset order, the default alignment of
+// 32, and the rule that the data blob starts at the first multiple of
+// the alignment after the tensor-info table.
+//
+// The byte-order test is the reference implementation's own and not the
+// specification's: `gguf-py`'s reader decides on the VERSION field,
+// because a version whose low sixteen bits are zero was read backwards.
+// The suite asserts that rule directly, on 3 and on 0x03000000.
+//
+// A REAL CHECKPOINT IS THE ORACLE and it arrives beside this file as a
+// generated run when the bodies land: a handful of small published
+// GGUFs read with `gguf-py` and with this package, every key, every
+// tensor offset and every size compared. The bytes assembled below are
+// assembled from the field definitions, and the suite says so rather
+// than implying a provenance it does not have.
+
+use std.test
+use std.bytes
+use ggufhdr
+use ggufval
+use ggufmeta
+use ggufinfo
+use ggufrange
+use ggufread
+use ggufwrite
+use gguferr
+
+// The twenty-four bytes at the front of an empty version 3 file:
+// `GGUF`, version 3, no tensors, no metadata.  Assembled from the
+// header's own field definitions.
+fn empty_v3_header() -> Bytes
+    bytes.from_hex("47475546030000000000000000000000" + "0000000000000000") ?? bytes.zeros(0)
+
+@test
+fn test_the_magic_is_four_characters_and_never_a_number_to_swap() [io]
+    test.case("the magic is G G U F, in that order, in both byte orders")
+    test.assert(bytes.len(ggufhdr.magic_bytes()) == 4)
+    test.assert(ggufhdr.magic_le() == 1179993927)
+
+    test.case("and a file that starts with them is a GGUF")
+    test.assert(ggufhdr.is_gguf(empty_v3_header()))
+    test.assert(ggufhdr.is_gguf(bytes.zeros(4)) == false)
+
+    test.case("the magic's range is four bytes at zero, the version's four at four")
+    test.assert(ggufhdr.magic_range().at == 0)
+    test.assert(ggufhdr.magic_range().len == 4)
+    test.assert(ggufhdr.version_range().at == 4)
+    test.assert(ggufhdr.version_range().len == 4)
+
+    test.case("and the one read that always answers is twenty-four bytes at zero")
+    test.assert(ggufhdr.probe_range().at == 0)
+    test.assert(ggufhdr.probe_range().len == 24)
+
+@test
+fn test_the_version_field_is_what_decides_the_byte_order() [io]
+    test.case("a version read the right way round is little-endian")
+    test.assert(ggufhdr.order_name(ggufhdr.detect_order(3)) == "little-endian")
+    test.assert(ggufhdr.order_name(ggufhdr.detect_order(2)) == "little-endian")
+
+    test.case("and one whose low sixteen bits are zero was read backwards")
+    // 3 written big-endian and read little-endian is 0x03000000,
+    // which is 50331648.  No real version is a multiple of 65536, so
+    // the test has no false positive to worry about.
+    test.assert(ggufhdr.order_name(ggufhdr.detect_order(50331648)) == "big-endian")
+    test.assert(ggufhdr.order_name(ggufhdr.detect_order(33554432)) == "big-endian")
+
+    test.case("the header carries the order it detected")
+    match ggufhdr.parse_header(empty_v3_header())
+        Ok(h)  => test.assert(ggufhdr.order_name(h.order) == "little-endian")
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_version_one_wrote_narrow_counts_and_two_and_three_write_wide() [io]
+    test.case("a count is four bytes in version 1")
+    match ggufhdr.count_width(1)
+        Ok(n)  => test.assert(n == 4)
+        Err(f) => test.fail(f.message())
+
+    test.case("and eight in versions 2 and 3")
+    match ggufhdr.count_width(2)
+        Ok(n)  => test.assert(n == 8)
+        Err(f) => test.fail(f.message())
+    match ggufhdr.count_width(3)
+        Ok(n)  => test.assert(n == 8)
+        Err(f) => test.fail(f.message())
+
+    test.case("so the header is sixteen bytes or twenty-four")
+    match ggufhdr.header_bytes(1)
+        Ok(n)  => test.assert(n == 16)
+        Err(f) => test.fail(f.message())
+    match ggufhdr.header_bytes(3)
+        Ok(n)  => test.assert(n == 24)
+        Err(f) => test.fail(f.message())
+
+    test.case("and a version this reader does not know is refused rather than read as 3")
+    test.assert(list.len(ggufhdr.supported_versions()) == 3)
+    test.assert(ggufhdr.latest_version() == 3)
+    match ggufhdr.header_bytes(4)
+        Ok(n)  => test.fail("version 4 has a header of ${n}")
+        Err(f) => test.assert(gguferr.fault_stage(f) == "header")
+
+@test
+fn test_the_alignment_defaults_to_thirty_two_and_must_be_a_power_of_two() [io]
+    test.case("a file that says nothing is aligned to thirty-two")
+    test.assert(ggufhdr.default_alignment() == 32)
+
+    test.case("a power of two is a valid alignment and nothing else is")
+    test.assert(ggufhdr.alignment_is_valid(1))
+    test.assert(ggufhdr.alignment_is_valid(32))
+    test.assert(ggufhdr.alignment_is_valid(4096))
+    test.assert(ggufhdr.alignment_is_valid(0) == false)
+    test.assert(ggufhdr.alignment_is_valid(-32) == false)
+    test.assert(ggufhdr.alignment_is_valid(48) == false)
+
+    test.case("aligning up moves to the next multiple and leaves a multiple alone")
+    match ggufhdr.align_up(33, 32)
+        Ok(n)  => test.assert(n == 64)
+        Err(f) => test.fail(f.message())
+    match ggufhdr.align_up(64, 32)
+        Ok(n)  => test.assert(n == 64)
+        Err(f) => test.fail(f.message())
+    match ggufhdr.align_up(0, 32)
+        Ok(n)  => test.assert(n == 0)
+        Err(f) => test.fail(f.message())
+
+    test.case("and an alignment that is not a power of two stops the arithmetic")
+    match ggufhdr.align_up(33, 48)
+        Ok(n)  => test.fail("aligned to ${n} against a bad alignment")
+        Err(f) => test.assert(gguferr.is_corrupt(f))
+
+@test
+fn test_a_metadata_value_keeps_the_width_the_file_declared_it_at() [io]
+    test.case("the thirteen codes are the format's own, in order")
+    test.assert(ggufval.value_type_code(GgufTypeUint8) == 0)
+    test.assert(ggufval.value_type_code(GgufTypeInt8) == 1)
+    test.assert(ggufval.value_type_code(GgufTypeUint16) == 2)
+    test.assert(ggufval.value_type_code(GgufTypeInt16) == 3)
+    test.assert(ggufval.value_type_code(GgufTypeUint32) == 4)
+    test.assert(ggufval.value_type_code(GgufTypeInt32) == 5)
+    test.assert(ggufval.value_type_code(GgufTypeFloat32) == 6)
+    test.assert(ggufval.value_type_code(GgufTypeBool) == 7)
+    test.assert(ggufval.value_type_code(GgufTypeString) == 8)
+    test.assert(ggufval.value_type_code(GgufTypeArray) == 9)
+    test.assert(ggufval.value_type_code(GgufTypeUint64) == 10)
+    test.assert(ggufval.value_type_code(GgufTypeInt64) == 11)
+    test.assert(ggufval.value_type_code(GgufTypeFloat64) == 12)
+
+    test.case("a code outside them is refused and named")
+    match ggufval.value_type_of_code(13)
+        Ok(t)  => test.fail("13 named ${ggufval.value_type_name(t)}")
+        Err(f) => test.assert(gguferr.fault_stage(f) == "metadata")
+
+    test.case("the fixed widths are 1, 2, 4 and 8, and two types have none")
+    test.assert(ggufval.scalar_width(GgufTypeUint8) == 1)
+    test.assert(ggufval.scalar_width(GgufTypeInt16) == 2)
+    test.assert(ggufval.scalar_width(GgufTypeFloat32) == 4)
+    test.assert(ggufval.scalar_width(GgufTypeUint64) == 8)
+    test.assert(ggufval.scalar_width(GgufTypeBool) == 1)
+    test.assert(ggufval.scalar_width(GgufTypeString) == 0)
+    test.assert(ggufval.scalar_width(GgufTypeArray) == 0)
+    test.assert(ggufval.is_fixed_width(GgufTypeString) == false)
+
+    test.case("eight of the thirteen are integers and four of those are unsigned")
+    test.assert(ggufval.is_integer_type(GgufTypeUint32))
+    test.assert(ggufval.is_integer_type(GgufTypeBool) == false)
+    test.assert(ggufval.is_unsigned_type(GgufTypeUint64))
+    test.assert(ggufval.is_unsigned_type(GgufTypeInt64) == false)
+
+    test.case("and a value carries the width back out for a writer to put back")
+    test.assert(ggufval.value_type_code(ggufval.value_kind(GgufNum(GgufTypeUint32, 4096))) == 4)
+    test.assert(ggufval.value_type_code(ggufval.value_kind(GgufNum(GgufTypeUint64, 4096))) == 10)
+    test.assert(ggufval.value_type_code(ggufval.value_kind(GgufText("llama"))) == 8)
+    test.assert(ggufval.value_type_code(ggufval.value_kind(GgufList(GgufTypeString, []))) == 9)
+
+@test
+fn test_the_accessors_do_not_convert_between_families() [io]
+    test.case("every integer width answers as_int")
+    match ggufval.as_int(GgufNum(GgufTypeUint8, 7))
+        Some(n) => test.assert(n == 7)
+        None    => test.fail("a uint8 is not an int")
+    match ggufval.as_int(GgufNum(GgufTypeInt64, -7))
+        Some(n) => test.assert(n == -7)
+        None    => test.fail("an int64 is not an int")
+
+    test.case("and a bool does not, because a key read as a number is a key misidentified")
+    test.assert_none(ggufval.as_int(GgufFlag(true)))
+    test.assert_none(ggufval.as_int(GgufReal(GgufTypeFloat32, 1.0)))
+
+    test.case("nor does an integer answer as_float")
+    test.assert_none(ggufval.as_float(GgufNum(GgufTypeUint32, 1)))
+    test.assert_some(ggufval.as_float(GgufReal(GgufTypeFloat32, 1.0)))
+
+    test.case("a list of strings answers both as_list and as_str_list")
+    let toks = GgufList(GgufTypeString, [GgufText("a"), GgufText("b")])
+    test.assert_some(ggufval.as_list(toks))
+    match ggufval.as_str_list(toks)
+        Some(xs) => test.assert(list.len(xs) == 2)
+        None     => test.fail("a list of strings is not a list of strings")
+
+    test.case("a list with one wrong item answers none rather than a short list")
+    // A short list would be a silently dropped token, which in a
+    // vocabulary is every id after it being wrong by one.
+    let mixed = GgufList(GgufTypeString, [GgufText("a"), GgufNum(GgufTypeUint32, 1)])
+    test.assert_none(ggufval.as_str_list(mixed))
+
+    test.case("an empty list keeps the element type it was declared with")
+    let empty_merges = GgufList(GgufTypeString, [])
+    match ggufval.as_str_list(empty_merges)
+        Some(xs) => test.assert(list.len(xs) == 0)
+        None     => test.fail("an empty list of strings is not one")
+
+@test
+fn test_an_array_may_nest_and_this_reader_bounds_how_deep() [io]
+    test.case("a scalar is depth zero and a flat list is depth one")
+    test.assert(ggufval.value_depth(GgufText("x")) == 0)
+    test.assert(ggufval.value_depth(GgufList(GgufTypeString, [GgufText("x")])) == 1)
+
+    test.case("and a list of lists is depth two")
+    let inner = GgufList(GgufTypeString, [GgufText("x")])
+    let outer = GgufList(GgufTypeArray, [inner])
+    test.assert(ggufval.value_depth(outer) == 2)
+
+    test.case("the bound is eight, which no honest checkpoint is near")
+    test.assert(ggufval.max_array_depth() == 8)
+
+    test.case("an empty list is still depth one, because it is still a list")
+    test.assert(ggufval.value_depth(GgufList(GgufTypeFloat32, [])) == 1)
+
+@test
+fn test_the_architecture_prefixes_every_hyperparameter_key() [io]
+    test.case("the general keys are fixed")
+    test.assert(ggufmeta.key_architecture() == "general.architecture")
+    test.assert(ggufmeta.key_alignment() == "general.alignment")
+    test.assert(ggufmeta.key_name() == "general.name")
+    test.assert(ggufmeta.key_file_type() == "general.file_type")
+    test.assert(ggufmeta.key_quantization_version() == "general.quantization_version")
+
+    test.case("the tokenizer keys are fixed, and the chat template is one of them")
+    test.assert(ggufmeta.key_tokenizer_model() == "tokenizer.ggml.model")
+    test.assert(ggufmeta.key_tokens() == "tokenizer.ggml.tokens")
+    test.assert(ggufmeta.key_token_type() == "tokenizer.ggml.token_type")
+    test.assert(ggufmeta.key_scores() == "tokenizer.ggml.scores")
+    test.assert(ggufmeta.key_merges() == "tokenizer.ggml.merges")
+    test.assert(ggufmeta.key_bos_token_id() == "tokenizer.ggml.bos_token_id")
+    test.assert(ggufmeta.key_eos_token_id() == "tokenizer.ggml.eos_token_id")
+    test.assert(ggufmeta.key_chat_template() == "tokenizer.chat_template")
+
+    test.case("and the hyperparameter keys are built from general.architecture")
+    // The part of GGUF nobody expects: a Llama model's layer count is
+    // under `llama.block_count` and a Qwen2 model's is under
+    // `qwen2.block_count`, so a reader that hard-coded the prefix
+    // reads one family and no other.
+    test.assert(ggufmeta.arch_key("llama", "block_count") == "llama.block_count")
+    test.assert(ggufmeta.key_block_count("llama") == "llama.block_count")
+    test.assert(ggufmeta.key_block_count("qwen2") == "qwen2.block_count")
+    test.assert(ggufmeta.key_context_length("llama") == "llama.context_length")
+    test.assert(ggufmeta.key_embedding_length("llama") == "llama.embedding_length")
+    test.assert(ggufmeta.key_feed_forward_length("llama") == "llama.feed_forward_length")
+    test.assert(ggufmeta.key_head_count("llama") == "llama.attention.head_count")
+    test.assert(ggufmeta.key_head_count_kv("llama") == "llama.attention.head_count_kv")
+    test.assert(ggufmeta.key_rms_eps("llama") == "llama.attention.layer_norm_rms_epsilon")
+    test.assert(ggufmeta.key_rope_freq_base("llama") == "llama.rope.freq_base")
+
+@test
+fn test_a_lookup_says_absent_and_wrong_type_differently() [io]
+    let m = ggufmeta.of_entries([
+        GgufKv { key: "general.architecture", value: GgufText("llama") },
+        GgufKv { key: "llama.block_count", value: GgufNum(GgufTypeUint32, 32) },
+        GgufKv { key: "general.alignment", value: GgufNum(GgufTypeUint32, 32) }])
+
+    test.case("the table counts what it holds and answers its keys in file order")
+    test.assert(ggufmeta.count(m) == 3)
+    test.assert(list.len(ggufmeta.keys(m)) == 3)
+    test.assert(ggufmeta.has(m, "llama.block_count"))
+    test.assert(ggufmeta.has(m, "llama.expert_count") == false)
+
+    test.case("a typed getter answers the value")
+    match ggufmeta.int_at(m, "llama.block_count")
+        Ok(n)  => test.assert(n == 32)
+        Err(f) => test.fail(f.message())
+    match ggufmeta.str_at(m, "general.architecture")
+        Ok(s)  => test.assert(s == "llama")
+        Err(f) => test.fail(f.message())
+
+    test.case("an absent key is a different fault from a key of the wrong type")
+    match ggufmeta.int_at(m, "llama.expert_count")
+        Ok(n)  => test.fail("an absent key answered ${n}")
+        Err(f) => test.assert(f.message() != "")
+    match ggufmeta.int_at(m, "general.architecture")
+        Ok(n)  => test.fail("a string answered ${n}")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("and the forgiving half swallows both")
+    test.assert(ggufmeta.int_or(m, "llama.expert_count", 0) == 0)
+    test.assert(ggufmeta.int_or(m, "general.architecture", -1) == -1)
+    test.assert(ggufmeta.int_or(m, "llama.block_count", -1) == 32)
+
+    test.case("a prefix selects a section of the table")
+    test.assert(list.len(ggufmeta.prefixed(m, "general.")) == 2)
+    test.assert(list.len(ggufmeta.prefixed(m, "llama.")) == 1)
+
+    test.case("and no well-formed table has a duplicate")
+    test.assert(list.len(ggufmeta.duplicates(m)) == 0)
+
+    test.case("the architecture and the alignment have calls of their own")
+    match ggufmeta.architecture(m)
+        Ok(a)  => test.assert(a == "llama")
+        Err(f) => test.fail(f.message())
+    match ggufmeta.alignment(m)
+        Ok(a)  => test.assert(a == 32)
+        Err(f) => test.fail(f.message())
+
+    test.case("and a table with no alignment key gets the default")
+    match ggufmeta.alignment(ggufmeta.of_entries([]))
+        Ok(a)  => test.assert(a == 32)
+        Err(f) => test.fail(f.message())
+
+    test.case("a base model has no chat template and that is not a fault")
+    test.assert_none(ggufmeta.chat_template(m))
+
+@test
+fn test_a_tensor_entry_is_relative_and_a_tensor_range_is_absolute() [io]
+    let embed = GgufTensorInfo { name: "token_embd.weight",
+                                 dims: [4096, 32000],
+                                 kind: GgufQ4_K,
+                                 offset: 0 }
+    let norm = GgufTensorInfo { name: "output_norm.weight",
+                                dims: [4096],
+                                kind: GgufF32,
+                                offset: 73728000 }
+
+    test.case("a tensor's shape is its dims, row first")
+    test.assert(ggufinfo.rank(embed) == 2)
+    test.assert(ggufinfo.row_elements(embed) == 4096)
+    test.assert(ggufinfo.row_count(embed) == 32000)
+    test.assert(ggufinfo.element_count(embed) == 131072000)
+    test.assert(ggufinfo.max_rank() == 4)
+
+    test.case("a rank-1 tensor is one row")
+    test.assert(ggufinfo.row_count(norm) == 1)
+    test.assert(ggufinfo.row_elements(norm) == 4096)
+
+    test.case("its byte count is its rows times its row bytes")
+    // 32000 rows of 16 blocks of 144 bytes is 73,728,000.
+    match ggufinfo.tensor_bytes(embed)
+        Ok(n)  => test.assert(n == 73728000)
+        Err(f) => test.fail(f.message())
+
+    test.case("and its RANGE adds where the data blob starts")
+    // The entry's offset is 0 — from the blob — and the blob starts
+    // at 4096, so the file position is 4096.  A reader that used the
+    // entry's own number would read the index instead.
+    match ggufinfo.tensor_range(embed, 4096)
+        Ok(r)  => test.assert(r.at == 4096 and r.len == 73728000)
+        Err(f) => test.fail(f.message())
+    match ggufinfo.tensor_range(norm, 4096)
+        Ok(r)  => test.assert(r.at == 4096 + 73728000 and r.len == 16384)
+        Err(f) => test.fail(f.message())
+
+    test.case("a row's range is inside the tensor's")
+    match ggufinfo.row_range(embed, 4096, 0)
+        Ok(r)  => test.assert(r.at == 4096 and r.len == 2304)
+        Err(f) => test.fail(f.message())
+    match ggufinfo.row_range(embed, 4096, 1)
+        Ok(r)  => test.assert(r.at == 4096 + 2304)
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_the_table_is_checked_against_itself_because_the_format_does_not() [io]
+    let good = GgufTensorInfo { name: "a", dims: [256], kind: GgufQ4_K, offset: 0 }
+
+    test.case("a well-formed entry validates and answers its size")
+    match ggufinfo.validate(good, 32)
+        Ok(n)  => test.assert(n == 144)
+        Err(f) => test.fail(f.message())
+
+    test.case("a rank of zero is not a scalar, it is a broken entry")
+    let rankless = GgufTensorInfo { name: "a", dims: [], kind: GgufF32, offset: 0 }
+    match ggufinfo.validate(rankless, 32)
+        Ok(n)  => test.fail("a rank-0 tensor sized at ${n}")
+        Err(f) => test.assert(gguferr.is_corrupt(f))
+
+    test.case("and neither is a rank of five")
+    let too_deep = GgufTensorInfo { name: "a", dims: [2, 2, 2, 2, 2], kind: GgufF32, offset: 0 }
+    match ggufinfo.validate(too_deep, 32)
+        Ok(n)  => test.fail("a rank-5 tensor sized at ${n}")
+        Err(f) => test.assert(gguferr.is_corrupt(f))
+
+    test.case("an offset that is not a multiple of the alignment is refused")
+    // llama.cpp's own reader assumes the alignment when it computes
+    // addresses, so a file that breaks it LOADS and produces nonsense
+    // — which is why this package refuses it instead.
+    let skew = GgufTensorInfo { name: "a", dims: [256], kind: GgufQ4_K, offset: 17 }
+    match ggufinfo.validate(skew, 32)
+        Ok(n)  => test.fail("a misaligned tensor sized at ${n}")
+        Err(f) => test.assert(gguferr.fault_offset(f) == 17)
+
+    test.case("two tensors claiming one byte is a file that would load and lie")
+    let a = GgufTensorInfo { name: "a", dims: [256], kind: GgufQ4_K, offset: 0 }
+    let b = GgufTensorInfo { name: "b", dims: [256], kind: GgufQ4_K, offset: 128 }
+    match ggufinfo.check_layout([a, b], 32, 4096)
+        Ok(n)  => test.fail("an overlapping layout accounted for ${n}")
+        Err(f) => test.assert(gguferr.is_corrupt(f))
+
+    test.case("and a tensor past the end of the file is a truncated download")
+    let far = GgufTensorInfo { name: "a", dims: [256], kind: GgufQ4_K, offset: 0 }
+    match ggufinfo.check_layout([far], 32, 16)
+        Ok(n)  => test.fail("a tensor past the end accounted for ${n}")
+        Err(f) => test.assert(gguferr.is_corrupt(f))
+
+    test.case("a caller that does not know the file's length skips that check only")
+    match ggufinfo.check_layout([far], 32, -1)
+        Ok(n)  => test.assert(n == 160)
+        Err(f) => test.fail(f.message())
+
+    test.case("the blob's length is the furthest reach rounded up, not the sum")
+    let c = GgufTensorInfo { name: "c", dims: [256], kind: GgufQ4_K, offset: 0 }
+    let d = GgufTensorInfo { name: "d", dims: [256], kind: GgufQ4_K, offset: 160 }
+    // 160 + 144 = 304, rounded up to 320.
+    match ggufinfo.data_bytes([c, d], 32)
+        Ok(n)  => test.assert(n == 320)
+        Err(f) => test.fail(f.message())
+
+    test.case("and the table can be read in offset order rather than table order")
+    let sorted = ggufinfo.by_offset([d, c])
+    test.assert(list.len(sorted) == 2)
+    test.assert(sorted[0].name == "c")
+
+    test.case("a prefix selects one transformer layer")
+    let l0 = GgufTensorInfo { name: "blk.0.attn_q.weight", dims: [256], kind: GgufQ4_K, offset: 0 }
+    let l1 = GgufTensorInfo { name: "blk.1.attn_q.weight", dims: [256], kind: GgufQ4_K, offset: 160 }
+    test.assert(list.len(ggufinfo.with_prefix([l0, l1], "blk.0.")) == 1)
+    test.assert(list.len(ggufinfo.names([l0, l1])) == 2)
+
+    test.case("and a histogram says a Q4_K_M file is four quantisations")
+    test.assert(list.len(ggufinfo.type_histogram([l0, l1])) >= 1)
+
+@test
+fn test_the_reader_asks_and_the_host_answers() [io]
+    test.case("a fresh reader wants the header and nothing else")
+    let r = ggufread.reader()
+    test.assert(ggufread.is_done(r) == false)
+    test.assert(ggufread.need(r).at == 0)
+    test.assert(ggufread.need(r).len == 24)
+    test.assert(ggufread.stage_name(r) == "header")
+    test.assert(ggufread.entries_seen(r) == 0)
+    test.assert(ggufread.tensors_seen(r) == 0)
+
+    test.case("an empty file's header completes the index in one answer")
+    match ggufread.offer(r, empty_v3_header())
+        Err(f) => test.fail(f.message())
+        Ok(r2) =>
+            test.assert(ggufread.is_done(r2))
+            test.assert(ggufread.need(r2).len == 0)
+            match ggufread.index_of(r2)
+                Ok(ix) => test.assert(ix.header.version == 3 and ix.alignment == 32)
+                Err(f) => test.fail(f.message())
+
+    test.case("a chunk shorter than the ask is a truncation, not a partial parse")
+    match ggufread.offer(ggufread.reader(), bytes.zeros(8))
+        Ok(r3) => test.fail("a short chunk left the reader at ${ggufread.stage_name(r3)}")
+        Err(f) => test.assert(gguferr.is_corrupt(f))
+
+    test.case("and asking for the index before it is complete is a fault, not half an answer")
+    match ggufread.index_of(ggufread.reader())
+        Ok(ix) => test.fail("an empty reader answered ${ix.header.tensor_count} tensor(s)")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("the whole-file convenience is the same machine with the loop written in")
+    match ggufread.parse_index(empty_v3_header())
+        Ok(ix) => test.assert(ix.header.metadata_count == 0 and ix.data_at == 32)
+        Err(f) => test.fail(f.message())
+
+    test.case("and a file that is not a GGUF stops at the magic")
+    match ggufread.parse_index(bytes.zeros(24))
+        Ok(ix) => test.fail("zeros parsed as v${ix.header.version}")
+        Err(f) => test.assert(gguferr.fault_stage(f) == "header")
+
+@test
+fn test_the_index_answers_a_tensor_by_name_and_a_blob_by_length() [io]
+    test.case("an index over an empty file has no tensors to answer for")
+    match ggufread.parse_index(empty_v3_header())
+        Err(f) => test.fail(f.message())
+        Ok(ix) =>
+            test.assert(ggufread.index_range(ix).at == 0)
+            test.assert(ggufread.index_range(ix).len == ix.data_at)
+            match ggufread.tensor_range(ix, "token_embd.weight")
+                Ok(r)  => test.fail("a tensor at ${r.at} in a file with none")
+                Err(f) => test.assert(f.message() != "")
+            // A blob whose length is not known answers a length of -1,
+            // which `range_fits` then refuses against any total — so a
+            // caller streaming a download cannot mistake it for a bound.
+            test.assert(ggufread.data_range(ix, -1).len == -1)
+            test.assert(ggufrange.range_fits(ggufread.data_range(ix, -1), 1024) == false)
+            test.assert(ggufread.data_range(ix, 1024).len == 1024 - ix.data_at)
+            match ggufread.check_index(ix, 1024)
+                Ok(n)  => test.assert(n == 0)
+                Err(f) => test.fail(f.message())
+
+@test
+fn test_a_range_is_two_integers_and_survives_the_file_not_being_there() [io]
+    let r = ggufrange.range(4096, 2304)
+
+    test.case("a range is where and how long, and its end is the sum")
+    test.assert(r.at == 4096 and r.len == 2304)
+    test.assert(ggufrange.range_end(r) == 6400)
+    test.assert(ggufrange.empty(4096).len == 0)
+
+    test.case("it fits a file that holds it and not one that does not")
+    test.assert(ggufrange.range_fits(r, 6400))
+    test.assert(ggufrange.range_fits(r, 6399) == false)
+
+    test.case("slicing a range out of a file that is too short says both numbers")
+    match ggufrange.slice(bytes.zeros(16), r)
+        Ok(b)  => test.fail("${bytes.len(b)} bytes out of sixteen")
+        Err(f) => test.assert(gguferr.fault_offset(f) == 4096)
+
+    test.case("a sub-range is expressed back in the file's own coordinates")
+    match ggufrange.sub(r, 144, 144)
+        Ok(s)  => test.assert(s.at == 4240 and s.len == 144)
+        Err(f) => test.fail(f.message())
+
+    test.case("and a sub-range that leaves its parent is refused")
+    match ggufrange.sub(r, 2300, 144)
+        Ok(s)  => test.fail("a sub-range at ${s.at} past its parent")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("joining two ranges covers both, and the padding between them")
+    let j = ggufrange.join(ggufrange.range(0, 16), ggufrange.range(32, 16))
+    test.assert(j.at == 0 and j.len == 48)
+
+    test.case("and two ranges either share a byte or they do not")
+    test.assert(ggufrange.overlaps(ggufrange.range(0, 32), ggufrange.range(16, 32)))
+    test.assert(ggufrange.overlaps(ggufrange.range(0, 32), ggufrange.range(32, 32)) == false)
+
+@test
+fn test_the_writer_puts_back_what_the_reader_read() [io]
+    test.case("the default writer is version 3, little-endian, aligned to thirty-two")
+    let w = ggufwrite.default_writer()
+    test.assert(w.version == 3)
+    test.assert(w.alignment == 32)
+    test.assert(ggufhdr.order_name(w.order) == "little-endian")
+
+    test.case("an index of nothing is a header and its padding")
+    // The header is 24 bytes and the blob starts at the next multiple
+    // of 32, which is 32.
+    match ggufwrite.index_bound(w)
+        Ok(n)  => test.assert(n == 32)
+        Err(f) => test.fail(f.message())
+    match ggufwrite.data_at(w)
+        Ok(n)  => test.assert(n == 32)
+        Err(f) => test.fail(f.message())
+
+    test.case("and the bytes it produces are the bytes the reader read")
+    // The round trip that makes this package safe to rewrite a file
+    // with: read an index, change nothing, write it back, and get the
+    // same bytes.  A round trip that is not exact is one that silently
+    // rewrites checkpoints.
+    match ggufwrite.finish(w)
+        Ok(b)  => test.assert(bytes.len(b) == 32)
+        Err(f) => test.fail(f.message())
+
+    test.case("big-endian is a version 3 addition and a version 2 file may not claim it")
+    match ggufwrite.writer(2, GgufBigEndian, 32, false)
+        Ok(w2) => test.fail("a v${w2.version} big-endian writer")
+        Err(f) => test.assert(gguferr.fault_stage(f) == "header")
+
+    test.case("and an alignment that is not a power of two is refused at the writer")
+    match ggufwrite.writer(3, GgufLittleEndian, 48, false)
+        Ok(w3) => test.fail("a writer aligned to ${w3.alignment}")
+        Err(f) => test.assert(f.message() != "")
+
+    test.case("changing one key keeps its position in the table")
+    match ggufwrite.set_kv(w, ggufmeta.key_chat_template(), GgufText("{{ x }}"))
+        Err(f) => test.fail(f.message())
+        Ok(w4) =>
+            test.assert(list.len(w4.entries) == 1)
+            match ggufwrite.index_bound(w4)
+                Ok(n)  => test.assert(n > 32)
+                Err(f) => test.fail(f.message())
+
+    test.case("dropping a key that is not there is not a fault")
+    test.assert(list.len(ggufwrite.drop_kv(w, "general.name").entries) == 0)
+
+    test.case("a buffer smaller than the index says so and is not corruption")
+    match ggufwrite.write_into(w, bytes.zeros(16), 16)
+        Ok(n)  => test.fail("${n} bytes into room for sixteen")
+        Err(f) => test.assert(gguferr.is_corrupt(f) == false)
+
+    test.case("and the writer plans every tensor's offset before a byte is copied")
+    match ggufwrite.planned_offsets(w)
+        Ok(offs) => test.assert(list.len(offs) == 0)
+        Err(f)   => test.fail(f.message())

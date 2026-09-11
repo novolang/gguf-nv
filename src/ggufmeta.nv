@@ -1,0 +1,315 @@
+// ggufmeta.nv — the metadata table: a list of key/value entries, the
+// typed lookups over it, and the names of the keys that mean something.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// WHY THIS IS A STRUCT AND NOT A LIST.  `GgufMeta` wraps `[GgufKv]` and
+// adds nothing today, and a lookup through it is a walk.  It exists so
+// that the first implementation can add an index without changing one
+// signature: a Llama-3 checkpoint has around thirty keys and a linear
+// walk is free, but a tool comparing a directory of two hundred
+// checkpoints does thirty lookups against each, and the day that
+// matters the type is already the place to put the map.
+//
+// THE KEY NAMES ARE FUNCTIONS, NOT LITERALS.  `key_chat_template()`
+// rather than `"tokenizer.chat_template"` written at the call site,
+// because the second one is a string that is wrong by one character
+// somewhere in every codebase that spells it more than twice — and
+// because when a key is renamed upstream, the package that owns the
+// format is the place the rename happens once.
+//
+// THE ARCHITECTURE PREFIXES ITS OWN KEYS, and that is the part of GGUF
+// nobody expects: a Llama model's layer count is under
+// `llama.block_count` and a Qwen2 model's is under
+// `qwen2.block_count`, so a reader has to read `general.architecture`
+// FIRST and build every other key name from it.  `arch_key` is that
+// concatenation, and the eight named helpers over it are the
+// hyperparameters every decoder-only architecture declares.
+
+// The metadata table, in file order.
+//
+// ```novo
+// use ggufmeta
+//
+// fn main() [io]
+//     let m = ggufmeta.of_entries([])
+//     println("${ggufmeta.count(m)}")
+//     // : 0
+// ```
+pub struct GgufMeta
+    // The entries, in the order the file wrote them.  Order is
+    // preserved end to end so that a read/write round trip produces
+    // the same bytes — see `ggufval.GgufKv`.
+    entries: [GgufKv]
+
+// A table over these entries.
+//
+// Duplicate keys are NOT refused here.  The format does not forbid
+// them, real files occasionally carry one where a conversion script
+// wrote a key twice, and a reader that refused would refuse a model
+// that llama.cpp loads.  What this package does instead is well
+// defined: every lookup answers the FIRST entry with the key, which is
+// what the reference implementation's own map does, and `duplicates`
+// is the call for a tool that wants to report them.
+pub fn of_entries(entries: [GgufKv]) -> GgufMeta
+    todo("gguf-nv.ggufmeta.of_entries")
+
+// The entries, in file order.
+pub fn entries_of(m: GgufMeta) -> [GgufKv]
+    todo("gguf-nv.ggufmeta.entries_of")
+
+// How many entries the table holds.
+pub fn count(m: GgufMeta) -> Int
+    todo("gguf-nv.ggufmeta.count")
+
+// The keys, in file order.
+pub fn keys(m: GgufMeta) -> [Str]
+    todo("gguf-nv.ggufmeta.keys")
+
+// The keys that appear more than once, each once.
+//
+// For a conversion tool that wants to say so.  Empty for every
+// well-formed file.
+pub fn duplicates(m: GgufMeta) -> [Str]
+    todo("gguf-nv.ggufmeta.duplicates")
+
+// The value under a key, or `None`.
+//
+// The lookup for a caller to whom absence is ordinary — an optional
+// `general.description`, a `tokenizer.chat_template` a base model does
+// not have.  The typed getters below are for a caller to whom absence
+// is a fault.
+pub fn find(m: GgufMeta, key: Str) -> ?GgufValue
+    todo("gguf-nv.ggufmeta.find")
+
+// Whether the key is in the table.
+pub fn has(m: GgufMeta, key: Str) -> Bool
+    todo("gguf-nv.ggufmeta.has")
+
+// The keys that start with this prefix, in file order.
+//
+// `prefixed(m, "tokenizer.")` is how a tool dumps the vocabulary's
+// section of the table without knowing what is in it, and
+// `prefixed(m, arch + ".")` is how it dumps the architecture's.
+pub fn prefixed(m: GgufMeta, prefix: Str) -> [Str]
+    todo("gguf-nv.ggufmeta.prefixed")
+
+// The integer under a key.
+//
+// `GgufKeyNotFound` when it is absent and `GgufWrongValueType` when it
+// is there and is not one of the eight integer widths — with both type
+// names in the message, because the usual cause is a key that changed
+// type between two versions of a conversion script.
+//
+// ```novo
+// use ggufmeta
+//
+// fn main() [io]
+//     let m = ggufmeta.of_entries([])
+//     match ggufmeta.int_at(m, ggufmeta.key_alignment())
+//         Ok(n)  => println("${n}")
+//         Err(f) => println(f.message())
+// ```
+pub fn int_at(m: GgufMeta, key: Str) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufmeta.int_at")
+
+// The float under a key, Float32 or Float64.
+pub fn float_at(m: GgufMeta, key: Str) -> Result<Float, GgufFault>
+    todo("gguf-nv.ggufmeta.float_at")
+
+// The bool under a key.
+pub fn bool_at(m: GgufMeta, key: Str) -> Result<Bool, GgufFault>
+    todo("gguf-nv.ggufmeta.bool_at")
+
+// The string under a key.
+pub fn str_at(m: GgufMeta, key: Str) -> Result<Str, GgufFault>
+    todo("gguf-nv.ggufmeta.str_at")
+
+// The array under a key, with the element type the file declared.
+//
+// The element type comes back because an empty array still has one,
+// and a caller deciding how to render `tokenizer.ggml.merges` on a
+// model that has none still wants to know it was an array of strings.
+pub fn list_at(m: GgufMeta, key: Str) -> Result<(GgufValueType, [GgufValue]), GgufFault>
+    todo("gguf-nv.ggufmeta.list_at")
+
+// The array of strings under a key.
+//
+// `tokenizer.ggml.tokens` and `tokenizer.ggml.merges`.
+pub fn str_list_at(m: GgufMeta, key: Str) -> Result<[Str], GgufFault>
+    todo("gguf-nv.ggufmeta.str_list_at")
+
+// The array of integers under a key, at any of the eight widths.
+//
+// `tokenizer.ggml.token_type`, and the per-layer lists some
+// architectures declare.
+pub fn int_list_at(m: GgufMeta, key: Str) -> Result<[Int], GgufFault>
+    todo("gguf-nv.ggufmeta.int_list_at")
+
+// The array of floats under a key.
+//
+// `tokenizer.ggml.scores`, which is as long as the vocabulary and is
+// most of a SentencePiece checkpoint's metadata by weight.
+pub fn float_list_at(m: GgufMeta, key: Str) -> Result<[Float], GgufFault>
+    todo("gguf-nv.ggufmeta.float_list_at")
+
+// The integer under a key, or `fallback` when the key is absent OR
+// holds something else.
+//
+// The forgiving half, for the keys a model may legitimately omit.  It
+// swallows a wrong type as well as an absence deliberately: a caller
+// that wanted to know the difference has `int_at`, and a caller
+// reaching for a default does not want a `Result` it will discard.
+pub fn int_or(m: GgufMeta, key: Str, fallback: Int) -> Int
+    todo("gguf-nv.ggufmeta.int_or")
+
+// The float under a key, or `fallback`.
+pub fn float_or(m: GgufMeta, key: Str, fallback: Float) -> Float
+    todo("gguf-nv.ggufmeta.float_or")
+
+// The bool under a key, or `fallback`.
+pub fn bool_or(m: GgufMeta, key: Str, fallback: Bool) -> Bool
+    todo("gguf-nv.ggufmeta.bool_or")
+
+// The string under a key, or `fallback`.
+pub fn str_or(m: GgufMeta, key: Str, fallback: Str) -> Str
+    todo("gguf-nv.ggufmeta.str_or")
+
+// `general.architecture` — the string every other key's prefix is
+// built from.
+pub fn key_architecture() -> Str
+    todo("gguf-nv.ggufmeta.key_architecture")
+
+// `general.alignment` — the UINT32 every tensor offset is a multiple
+// of.  Absent means 32.
+pub fn key_alignment() -> Str
+    todo("gguf-nv.ggufmeta.key_alignment")
+
+// `general.name` — what the model calls itself.
+pub fn key_name() -> Str
+    todo("gguf-nv.ggufmeta.key_name")
+
+// `general.quantization_version` — which revision of the quantisation
+// formats the file was written with.  2 for everything current.
+pub fn key_quantization_version() -> Str
+    todo("gguf-nv.ggufmeta.key_quantization_version")
+
+// `general.file_type` — the quantisation the file was produced by, as
+// llama.cpp's own enumeration.  A HINT and not a fact: it names what
+// the quantiser was asked for, while the tensor-info table names what
+// each tensor actually is, and a mixed quantisation makes them
+// disagree by design.  `ggufinfo` is the authority; this is what a
+// filename says.
+pub fn key_file_type() -> Str
+    todo("gguf-nv.ggufmeta.key_file_type")
+
+// `tokenizer.ggml.model` — "llama", "gpt2", "bert" or "rwkv": which
+// tokenizer family the vocabulary below it is for.
+pub fn key_tokenizer_model() -> Str
+    todo("gguf-nv.ggufmeta.key_tokenizer_model")
+
+// `tokenizer.ggml.tokens` — the vocabulary, as an array of strings.
+pub fn key_tokens() -> Str
+    todo("gguf-nv.ggufmeta.key_tokens")
+
+// `tokenizer.ggml.token_type` — one integer per token: normal,
+// unknown, control, user-defined, unused or byte.
+pub fn key_token_type() -> Str
+    todo("gguf-nv.ggufmeta.key_token_type")
+
+// `tokenizer.ggml.scores` — one float per token, for the
+// SentencePiece-derived tokenizers.
+pub fn key_scores() -> Str
+    todo("gguf-nv.ggufmeta.key_scores")
+
+// `tokenizer.ggml.merges` — the BPE merge table, as an array of
+// strings each holding two pieces separated by a space.
+pub fn key_merges() -> Str
+    todo("gguf-nv.ggufmeta.key_merges")
+
+// `tokenizer.chat_template` — the Jinja2 template that turns a list of
+// chat messages into the single string the model was trained on.
+//
+// The seam to prompt-nv, and the reason this key has a named accessor
+// of its own below rather than only a constant: it is the one piece of
+// metadata whose consumer is not an inference engine.
+pub fn key_chat_template() -> Str
+    todo("gguf-nv.ggufmeta.key_chat_template")
+
+// `tokenizer.ggml.bos_token_id` — the token a sequence begins with.
+pub fn key_bos_token_id() -> Str
+    todo("gguf-nv.ggufmeta.key_bos_token_id")
+
+// `tokenizer.ggml.eos_token_id` — the token generation stops at.
+pub fn key_eos_token_id() -> Str
+    todo("gguf-nv.ggufmeta.key_eos_token_id")
+
+// `<arch>.<suffix>` — an architecture-scoped key name.
+//
+// The concatenation every hyperparameter lookup needs, written once.
+// `arch_key("llama", "block_count")` is `"llama.block_count"`.
+pub fn arch_key(arch: Str, suffix: Str) -> Str
+    todo("gguf-nv.ggufmeta.arch_key")
+
+// `<arch>.block_count` — how many transformer layers.
+pub fn key_block_count(arch: Str) -> Str
+    todo("gguf-nv.ggufmeta.key_block_count")
+
+// `<arch>.context_length` — the trained context window.
+pub fn key_context_length(arch: Str) -> Str
+    todo("gguf-nv.ggufmeta.key_context_length")
+
+// `<arch>.embedding_length` — the model dimension.
+pub fn key_embedding_length(arch: Str) -> Str
+    todo("gguf-nv.ggufmeta.key_embedding_length")
+
+// `<arch>.feed_forward_length` — the width of the MLP.
+pub fn key_feed_forward_length(arch: Str) -> Str
+    todo("gguf-nv.ggufmeta.key_feed_forward_length")
+
+// `<arch>.attention.head_count` — how many query heads.
+pub fn key_head_count(arch: Str) -> Str
+    todo("gguf-nv.ggufmeta.key_head_count")
+
+// `<arch>.attention.head_count_kv` — how many key/value heads.  Fewer
+// than the query heads means grouped-query attention.
+pub fn key_head_count_kv(arch: Str) -> Str
+    todo("gguf-nv.ggufmeta.key_head_count_kv")
+
+// `<arch>.attention.layer_norm_rms_epsilon` — the epsilon in the RMS
+// norm.  A Float32 in every checkpoint this has been read from.
+pub fn key_rms_eps(arch: Str) -> Str
+    todo("gguf-nv.ggufmeta.key_rms_eps")
+
+// `<arch>.rope.freq_base` — theta, the base of the rotary embedding's
+// frequency ladder.
+pub fn key_rope_freq_base(arch: Str) -> Str
+    todo("gguf-nv.ggufmeta.key_rope_freq_base")
+
+// `general.architecture`, or `GgufKeyNotFound`.
+//
+// The first thing a loader reads and the thing every subsequent key
+// name is built from, so it is worth a call of its own rather than a
+// `str_at` with a constant.
+pub fn architecture(m: GgufMeta) -> Result<Str, GgufFault>
+    todo("gguf-nv.ggufmeta.architecture")
+
+// The file's alignment: `general.alignment` when it is there and valid,
+// 32 when it is absent, and `GgufBadAlignment` when it is there and is
+// not a positive power of two.
+//
+// The one lookup that is not a plain getter, because the default and
+// the validation both belong to the format rather than to the caller —
+// and because getting it wrong moves every tensor in the file.
+pub fn alignment(m: GgufMeta) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufmeta.alignment")
+
+// `tokenizer.chat_template`, or `None`.
+//
+// A base model has none and an instruction-tuned one usually does.
+// The string is a Jinja2 template, and what renders it is the caller's
+// choice: prompt-nv's `promptchat` handles the three families whose
+// shape is fixed, and tera-nv renders an arbitrary one.  This package
+// takes no position beyond handing over the text.
+pub fn chat_template(m: GgufMeta) -> ?Str
+    todo("gguf-nv.ggufmeta.chat_template")

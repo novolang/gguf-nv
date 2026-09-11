@@ -1,0 +1,335 @@
+// ggufquant.nv — the GGML tensor types, as two numbers each: how many
+// weights are in a block, and how many bytes that block occupies.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS IS THE MODULE THE PACKAGE EXISTS FOR.  Everything else here
+// reads a table; this is the part a caller cannot derive, cannot guess,
+// and gets wrong in a way that produces a model which loads and speaks
+// nonsense.  A Q4_K tensor of 4096 by 4096 is not 8 MB and it is not 12
+// MB — it is 4096 rows of 16 blocks of 144 bytes, which is 9,437,184 —
+// and a loader that computed it any other way reads the next tensor's
+// bytes as the end of this one.
+//
+// DEQUANTISATION IS NOT HERE, AND THAT IS THE SPLIT WITH ml.
+// `orbit/ml` owns the kernels: the CUDA and ROCm matvecs, the
+// upload-time quantiser, the device dispatch that chooses between them.
+// This package owns the LAYOUT — where a block starts, how long it is,
+// and which of the twenty-odd types it is — so that a caller can slice
+// one tensor's bytes out of a 40 GB file, hand them to ml, and have
+// both parties agree on where the block boundaries are without either
+// of them having read the other's source.
+//
+// The number that makes the split worth making: ml's own Q4_K-style
+// supergroup is 168 bytes over 256 weights, and GGML's `block_q4_K` is
+// 144 over the same 256.  They are different formats with similar
+// names, and the only way that stays visible is for the file format's
+// numbers to live in the file format's package with the file format's
+// spelling on them.
+//
+// WHERE THE NUMBERS COME FROM.  `ggml-common.h`'s block structs, one
+// per type, and nothing else: every `block_bytes` below is the `sizeof`
+// of one of them, and the test suite lists the fields it is the sum of
+// so that a reader can check the arithmetic without the header.
+//
+// THE SUPERBLOCK IS 256, THE BLOCK IS 32.  Two block sizes cover every
+// quantised type: the original Q4_0 family works 32 weights at a time
+// with one scale, and the K-quants work 256 at a time with a
+// hierarchy of scales — a per-superblock scale and sixteen or eight
+// per-sub-block ones packed into six bits each.  `block_elements` is
+// which, and it is why a row length must be a multiple of it.
+
+// A GGML tensor type.
+//
+// The codes are the format's own and the names are the format's own.
+// Five codes are missing from this enum on purpose — see
+// `withdrawn_name`.
+//
+// ```novo
+// use ggufquant
+//
+// fn main() [io]
+//     println("${ggufquant.block_bytes(GgufQ4_K)}")
+//     // : 144
+// ```
+pub enum GgufType
+    // Code 0.  One weight, four bytes.  What a norm weight is, and
+    // what a small model is when nobody quantised it.
+    GgufF32
+    // Code 1.  One weight, two bytes, IEEE 754 half.
+    GgufF16
+    // Code 2.  32 weights in 18 bytes: a half-precision scale and
+    // sixteen bytes of packed nibbles, each nibble minus eight.
+    GgufQ4_0
+    // Code 3.  32 weights in 20 bytes: Q4_0 plus a half-precision
+    // minimum, so the nibble is not centred but offset.
+    GgufQ4_1
+    // Code 6.  32 weights in 22 bytes: Q4_0 plus a four-byte plane of
+    // fifth bits.
+    GgufQ5_0
+    // Code 7.  32 weights in 24 bytes: Q5_0 plus the minimum.
+    GgufQ5_1
+    // Code 8.  32 weights in 34 bytes: a half-precision scale and one
+    // signed byte each.  The type an activation is quantised to at
+    // runtime, and the highest-fidelity quantisation a file carries.
+    GgufQ8_0
+    // Code 9.  32 weights in 36 bytes: Q8_0 plus a half-precision sum
+    // of the quantised values, which the dot product against a Q4_1
+    // row needs.  Runtime only in practice — see `is_file_type`.
+    GgufQ8_1
+    // Code 10.  256 weights in 84 bytes.  Two bits each, with
+    // sixteen four-bit scale/minimum pairs and a superblock scale and
+    // minimum.
+    GgufQ2_K
+    // Code 11.  256 weights in 110 bytes.  Three bits each: two in a
+    // packed plane and one in a mask, with twelve bytes of six-bit
+    // scales.
+    GgufQ3_K
+    // Code 12.  256 weights in 144 bytes.  Four bits each, twelve
+    // bytes of six-bit scale/minimum pairs, and a superblock scale and
+    // minimum.  The commonest quantisation in the world.
+    GgufQ4_K
+    // Code 13.  256 weights in 176 bytes: Q4_K plus a plane of fifth
+    // bits.
+    GgufQ5_K
+    // Code 14.  256 weights in 210 bytes.  Six bits each — four in a
+    // low plane and two in a high one — with sixteen signed eight-bit
+    // scales and a superblock scale.
+    GgufQ6_K
+    // Code 15.  256 weights in 292 bytes.  The activation side of a
+    // K-quant matvec, and it is NOT written to files — see
+    // `is_file_type`.
+    GgufQ8_K
+    // Code 16.  256 weights in 66 bytes.  The first of the
+    // importance-matrix family: the weights are indices into a fixed
+    // codebook of eight-value groups rather than numbers.
+    GgufIQ2_XXS
+    // Code 17.  256 weights in 74 bytes.
+    GgufIQ2_XS
+    // Code 22.  256 weights in 82 bytes.
+    GgufIQ2_S
+    // Code 18.  256 weights in 98 bytes.
+    GgufIQ3_XXS
+    // Code 21.  256 weights in 110 bytes.  The same size as Q3_K and
+    // a completely different layout, which is why a reader that
+    // matched on size rather than on code would be wrong exactly once.
+    GgufIQ3_S
+    // Code 19.  256 weights in 50 bytes — a little over one and a half
+    // bits each.
+    GgufIQ1_S
+    // Code 29.  256 weights in 56 bytes.  No superblock scale field at
+    // all: the scale is packed into `scales` alongside the sub-block
+    // ones.
+    GgufIQ1_M
+    // Code 20.  32 weights in 18 bytes.  The same size as Q4_0 and a
+    // non-linear codebook instead of a uniform step, which is the
+    // whole difference.
+    GgufIQ4_NL
+    // Code 23.  256 weights in 136 bytes: IQ4_NL's codebook with a
+    // K-quant's scale hierarchy.
+    GgufIQ4_XS
+    // Code 24.  One value, one byte, signed.  A tensor of integers,
+    // not of weights — token ids and the like.
+    GgufI8
+    // Code 25.  One value, two bytes, signed.
+    GgufI16
+    // Code 26.  One value, four bytes, signed.
+    GgufI32
+    // Code 27.  One value, eight bytes, signed.
+    GgufI64
+    // Code 28.  One value, eight bytes, IEEE 754 double.
+    GgufF64
+    // Code 30.  One weight, two bytes: the top half of an F32.  Not
+    // F16 — same width, different exponent range, and a loader that
+    // confused them produces infinities.
+    GgufBF16
+    // Code 34.  256 weights in 54 bytes.  Ternary: five trits packed
+    // per byte, for a model trained to weights of -1, 0 and 1.
+    GgufTQ1_0
+    // Code 35.  256 weights in 66 bytes.  Ternary at two bits each,
+    // which is larger than TQ1_0 and much faster to unpack.
+    GgufTQ2_0
+
+// The format's code for a type.
+pub fn type_code(t: GgufType) -> Int
+    todo("gguf-nv.ggufquant.type_code")
+
+// The type a code names.
+//
+// `GgufBadTensorType` for a code this reader does not know, INCLUDING
+// the five withdrawn ones — a file that uses them cannot be read
+// correctly by anything current, so answering with a type would be
+// worse than refusing.  `withdrawn_name` is what a tool prints
+// alongside the refusal.
+pub fn type_of_code(code: Int) -> Result<GgufType, GgufFault>
+    todo("gguf-nv.ggufquant.type_of_code")
+
+// The type's name as the format spells it: "F32", "Q4_K", "IQ2_XXS".
+//
+// Upper case, with the underscore, because that is what appears in a
+// model card, in a filename and in llama.cpp's own output, and a tool
+// that spelled it differently would be a tool whose output cannot be
+// grepped against the thing it describes.
+pub fn type_name(t: GgufType) -> Str
+    todo("gguf-nv.ggufquant.type_name")
+
+// The type a name spells, for a command line that took `--type Q4_K`.
+//
+// Case-insensitive on the letters and exact on the underscores.
+pub fn type_of_name(name: Str) -> ?GgufType
+    todo("gguf-nv.ggufquant.type_of_name")
+
+// Every type this package knows, in code order.
+//
+// What a `gguf types` listing iterates, and what the suite iterates to
+// check that every type answers every question in this module.
+pub fn known_types() -> [GgufType]
+    todo("gguf-nv.ggufquant.known_types")
+
+// How many weights one block holds: 1 for the unquantised types, 32
+// for the Q4_0 family and IQ4_NL, 256 for the K-quants, the IQ family
+// and the ternary types.
+//
+// The number a row length must be a multiple of.  A Q4_K tensor whose
+// first dimension is 100 does not exist; the quantiser would have
+// padded it or refused, and a file that carries one is damaged.
+//
+// ```novo
+// use ggufquant
+//
+// fn main() [io]
+//     println("${ggufquant.block_elements(GgufQ4_K)}")
+//     // : 256
+// ```
+pub fn block_elements(t: GgufType) -> Int
+    todo("gguf-nv.ggufquant.block_elements")
+
+// How many bytes one block occupies.
+//
+// The `sizeof` of the type's struct in `ggml-common.h`, and the suite
+// lists the fields each one is the sum of.  For the unquantised types
+// this is the scalar width: 4 for F32, 2 for F16 and BF16, 8 for F64
+// and I64.
+pub fn block_bytes(t: GgufType) -> Int
+    todo("gguf-nv.ggufquant.block_bytes")
+
+// How many bytes one weight costs on average, which is
+// `block_bytes * 8 / block_elements`.
+//
+// What a model card means by "4.5 bits per weight", and the number a
+// tool sorts a type list by.  A Float rather than a ratio because it is
+// for reporting: nothing in this package's arithmetic uses it, and
+// every size computation goes through `block_bytes` so that no rounding
+// can enter it.
+pub fn bits_per_weight(t: GgufType) -> Float
+    todo("gguf-nv.ggufquant.bits_per_weight")
+
+// Whether the type packs more than one weight into a block.
+//
+// False for F32, F16, BF16, F64 and the four integer types; true for
+// everything else.  Equivalently `block_elements(t) > 1`, and it is
+// named because that is not what a reader of the call site is thinking
+// about.
+pub fn is_quantized(t: GgufType) -> Bool
+    todo("gguf-nv.ggufquant.is_quantized")
+
+// Whether the type is one of the K-quants: Q2_K through Q8_K.
+//
+// The family with a two-level scale hierarchy over a 256-weight
+// superblock.  A caller choosing a dequantisation kernel dispatches on
+// this before it dispatches on the type.
+pub fn is_k_quant(t: GgufType) -> Bool
+    todo("gguf-nv.ggufquant.is_k_quant")
+
+// Whether the type is one of the importance-matrix family: the nine
+// whose names start `IQ`.
+//
+// They share a property no other type has: the weights are indices
+// into a fixed codebook that ships with the implementation, so the
+// file does not carry enough information to dequantise on its own.  A
+// tool that reports what it can do with a file should say so, and this
+// is the test.
+pub fn is_iq_type(t: GgufType) -> Bool
+    todo("gguf-nv.ggufquant.is_iq_type")
+
+// Whether the type is ternary: TQ1_0 or TQ2_0.
+pub fn is_ternary(t: GgufType) -> Bool
+    todo("gguf-nv.ggufquant.is_ternary")
+
+// Whether a tensor in a FILE may have this type.
+//
+// False for Q8_K and Q8_1, and true for everything else.  Both exist
+// to hold a quantised ACTIVATION during a matrix-vector product — the
+// left-hand side of a K-quant or Q4_1 dot product is quantised on the
+// fly and thrown away — and no quantiser writes either to disk.  A file
+// that declares one is either from a tool nobody else can read or, far
+// more often, a tensor-info table a reader lost its place in.
+pub fn is_file_type(t: GgufType) -> Bool
+    todo("gguf-nv.ggufquant.is_file_type")
+
+// The five codes that were types and are not: 4 and 5 (Q4_2 and Q4_3,
+// removed in 2023) and 31, 32 and 33 (the Q4_0_4_4, Q4_0_4_8 and
+// Q4_0_8_8 repacked variants, removed in 2024 in favour of runtime
+// repacking).
+//
+// Listed rather than forgotten because a file that uses one is a real
+// file somebody has, and "GGML tensor type 31 is not one this reader
+// knows" sends them to a search engine while "Q4_0_4_8, withdrawn —
+// requantise with a current llama.cpp" sends them to the fix.
+pub fn withdrawn_codes() -> [Int]
+    todo("gguf-nv.ggufquant.withdrawn_codes")
+
+// The name a withdrawn code used to have, and `None` for a code that
+// was never a type at all.
+pub fn withdrawn_name(code: Int) -> ?Str
+    todo("gguf-nv.ggufquant.withdrawn_name")
+
+// How many bytes a row of `elements` weights of this type occupies.
+//
+// `GgufRaggedRow` when `elements` is not a multiple of
+// `block_elements`.  The name in the fault is the caller's to supply,
+// so this one takes it: a message that says which tensor is the
+// difference between a two-minute fix and an afternoon.
+//
+// ```novo
+// use ggufquant
+//
+// fn main() [io]
+//     match ggufquant.row_bytes(GgufQ4_K, "blk.0.attn_q.weight", 4096)
+//         Ok(n)  => println("${n}")
+//         Err(f) => println(f.message())
+// ```
+pub fn row_bytes(t: GgufType, name: Str, elements: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufquant.row_bytes")
+
+// How many bytes a whole tensor of this shape occupies.
+//
+// `dims` is the format's own order — `dims[0]` is the ROW length, the
+// fastest-varying axis, the one quantisation blocks run along — and
+// every other dimension multiplies the row count.  That order is the
+// reverse of the one a PyTorch state dict prints, and getting it
+// backwards is the second most common way to compute the wrong size:
+// a 4096 by 11008 feed-forward weight is 11008 rows of 4096, not the
+// other way round, and the two round differently under a 256-weight
+// block.
+pub fn tensor_bytes(t: GgufType, name: Str, dims: [Int]) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufquant.tensor_bytes")
+
+// How many blocks a row of `elements` weights is made of.
+//
+// The loop bound for a caller walking a row block by block, and the
+// multiplier for a caller computing an offset into one:
+// `block_index * block_bytes(t)` is where block `block_index` starts,
+// and that is the whole of the addressing this package promises.
+pub fn blocks_in_row(t: GgufType, name: Str, elements: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufquant.blocks_in_row")
+
+// The byte range of one block inside a tensor whose data starts at
+// `data_at`.
+//
+// The call that makes "slice a tensor's bytes without decoding" a
+// sentence rather than an aspiration: a caller streaming a Q6_K tensor
+// through a device with 64 KB of scratch asks for block 0 through
+// block 311, uploads them, and asks for the next 312.
+pub fn block_range(t: GgufType, data_at: Int, block_index: Int) -> Result<GgufRange, GgufFault>
+    todo("gguf-nv.ggufquant.block_range")

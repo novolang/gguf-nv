@@ -1,0 +1,14 @@
+# Build outputs.
+_novo/
+
+# The built package binary — a library package still produces one when
+# a probe or a test is built against it.
+gguf-nv
+
+# Generated from the sources by `novo doc`; a committed copy is a
+# second original.
+APIDOC.md
+
+# Resolved deps.  Regenerated from novo.toml on every build, and a
+# committed copy pins what the manifest already ranges over.
+novo.lock

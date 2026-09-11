@@ -1,0 +1,297 @@
+// ggufval.nv — a metadata value: thirteen types, one of which is an
+// array of the other twelve, or of itself.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE VALUE KEEPS ITS DECLARED TYPE, AND THAT IS THE WHOLE DESIGN.
+// Eight of the thirteen types are integers, and novo-lang has one
+// integer.  A value enum with a single `GgufNum(Int)` variant would
+// read every one of them correctly and write none of them back:
+// `general.file_type` is a UINT32 and `tokenizer.ggml.bos_token_id` is
+// a UINT32, and a writer that had only the number would have to guess
+// a width per key from a table it would have to maintain.
+//
+// So each numeric variant carries the `GgufValueType` the file
+// declared, and `ggufwrite` writes back what `ggufread` read, byte for
+// byte, for every key it did not change.  A caller that only wants the
+// number never looks: `as_int` answers it for all eight widths.
+//
+// ARRAYS NEST, AND THE FORMAT DOES NOT BOUND THE NESTING.  An array
+// declares an element type, and that element type may be ARRAY.
+// Nothing in the specification says how deep, which means a reader that
+// recursed freely is a stack overflow a forty-byte file can ask for.
+// `max_array_depth` is this package's bound, `GgufArrayTooDeep` is what
+// a file past it gets, and the number is high enough that no real
+// checkpoint is anywhere near it — the deepest thing in a real GGUF is
+// an array of strings, at depth one.
+//
+// AN ARRAY IS HOMOGENEOUS.  The element type is declared once, before
+// the count, and every element is that type.  `GgufList` carries it
+// even when the list is empty, because an empty
+// `tokenizer.ggml.merges` still declares STRING and a writer has to
+// write that back.
+
+// Which of the thirteen a value is.
+//
+// The codes are the format's own, 0 through 12, and the gap a reader
+// expects is that there is none: unlike the tensor types, no metadata
+// value type has ever been withdrawn.
+//
+// ```novo
+// use ggufval
+//
+// fn main() [io]
+//     println(ggufval.value_type_name(GgufTypeString))
+//     // : string
+// ```
+pub enum GgufValueType
+    // Code 0: one unsigned byte.
+    GgufTypeUint8
+    // Code 1: one signed byte.
+    GgufTypeInt8
+    // Code 2: two bytes, unsigned.
+    GgufTypeUint16
+    // Code 3: two bytes, signed.
+    GgufTypeInt16
+    // Code 4: four bytes, unsigned.  The commonest numeric type in a
+    // real checkpoint by a wide margin — every count, every dimension
+    // and every token id is one.
+    GgufTypeUint32
+    // Code 5: four bytes, signed.
+    GgufTypeInt32
+    // Code 6: four bytes, IEEE 754 single.  `rope_freq_base` and the
+    // epsilons.
+    GgufTypeFloat32
+    // Code 7: one byte, 0 or 1.  A byte that is neither is a file this
+    // reader refuses rather than rounds.
+    GgufTypeBool
+    // Code 8: a length then that many UTF-8 bytes, with no terminator.
+    // The length's width is the version's — see `ggufhdr.count_width`.
+    GgufTypeString
+    // Code 9: an element type, a count, then the elements with no
+    // per-element type tag.  May hold arrays.
+    GgufTypeArray
+    // Code 10: eight bytes, unsigned.  The one type whose full range
+    // does not fit novo-lang's signed `Int`; a value with its top bit
+    // set is `GgufUnsignedOverflow` rather than a negative number.
+    GgufTypeUint64
+    // Code 11: eight bytes, signed.
+    GgufTypeInt64
+    // Code 12: eight bytes, IEEE 754 double.
+    GgufTypeFloat64
+
+// One metadata value, with the type the file declared it as.
+//
+// Five variants over thirteen types, because the grouping a caller
+// works in is not the grouping the file writes in: eight integer
+// widths are one `GgufNum`, two float widths are one `GgufReal`, and
+// the declared type rides along so a writer can put it back.
+//
+// ```novo
+// use ggufval
+//
+// fn main() [io]
+//     let v = GgufNum(GgufTypeUint32, 4096)
+//     println("${ggufval.as_int(v) ?? -1}")
+// ```
+pub enum GgufValue
+    // Any of the eight integer types.  `kind` is which one, and it is
+    // what `ggufwrite` writes; `value` is the number, sign-extended
+    // for the signed widths and zero-extended for the unsigned ones.
+    GgufNum(kind: GgufValueType, value: Int)
+    // Float32 or Float64.  `kind` is which, because the two are four
+    // bytes and eight and a round trip has to keep them apart — a
+    // single-precision `rope_freq_base` written back as a double moves
+    // every tensor in the file by four bytes.
+    GgufReal(kind: GgufValueType, value: Float)
+    // A bool.  No `kind`: there is one boolean type and no width to
+    // remember.
+    GgufFlag(value: Bool)
+    // A string, already decoded from its UTF-8 bytes.
+    GgufText(value: Str)
+    // An array.  `element` is the type the file declared for every
+    // item, and it is carried even when `items` is empty — an empty
+    // array of strings and an empty array of floats are different
+    // bytes, and a writer needs to know which it is putting back.
+    GgufList(element: GgufValueType, items: [GgufValue])
+
+// One entry of the metadata table.
+//
+// The order of the table is preserved by everything in this package:
+// `ggufread` produces the entries in file order and `ggufwrite` writes
+// them in the order it is given.  Nothing in the format requires an
+// order, and llama.cpp does not depend on one — but a round trip that
+// reordered would produce a different file from the same input, and a
+// tool comparing two checkpoints would report a difference that is not
+// there.
+pub struct GgufKv
+    // The key, as UTF-8.  By convention `general.*` for the file's own
+    // facts, `<arch>.*` for the architecture's hyperparameters, and
+    // `tokenizer.*` for the vocabulary — `ggufmeta` has the named
+    // constants for the ones that matter.
+    key: Str
+    // What the key holds.
+    value: GgufValue
+
+// The format's code for a value type: 0 through 12.
+pub fn value_type_code(t: GgufValueType) -> Int
+    todo("gguf-nv.ggufval.value_type_code")
+
+// The value type a code names.
+//
+// `GgufBadValueType` for anything outside 0 through 12.  A stricter
+// answer than the reference implementation's, which treats an unknown
+// code as the end of the table; this reader says which code it met,
+// because the usual cause is a reader that lost its place two keys
+// ago and the code it reports is the first byte of a string.
+pub fn value_type_of_code(code: Int) -> Result<GgufValueType, GgufFault>
+    todo("gguf-nv.ggufval.value_type_of_code")
+
+// The type's name, lower case, as the specification spells it:
+// "uint8", "int8", … "string", "array", "float64".
+//
+// The spelling `GgufWrongValueType` uses on both sides, so a message
+// and a lookup table use one vocabulary.
+pub fn value_type_name(t: GgufValueType) -> Str
+    todo("gguf-nv.ggufval.value_type_name")
+
+// How many bytes one value of a fixed-width type occupies: 1, 2, 4 or
+// 8.
+//
+// Zero for `GgufTypeString` and `GgufTypeArray`, which have no fixed
+// width at all — a caller sizing a read of an array of UINT32 wants
+// `4 * count`, and a caller sizing a read of an array of STRING has to
+// walk it.
+pub fn scalar_width(t: GgufValueType) -> Int
+    todo("gguf-nv.ggufval.scalar_width")
+
+// Whether the type has a fixed width, which is every type but STRING
+// and ARRAY.
+pub fn is_fixed_width(t: GgufValueType) -> Bool
+    todo("gguf-nv.ggufval.is_fixed_width")
+
+// Whether the type is one of the eight integers.
+pub fn is_integer_type(t: GgufValueType) -> Bool
+    todo("gguf-nv.ggufval.is_integer_type")
+
+// Whether the type is unsigned, which decides whether a top bit is a
+// sign or a magnitude.
+pub fn is_unsigned_type(t: GgufValueType) -> Bool
+    todo("gguf-nv.ggufval.is_unsigned_type")
+
+// How deep an array may nest before this reader refuses: 8.
+//
+// A bound rather than the format's silence.  Depth 1 is an array of
+// strings, which every tokenizer has; depth 2 has been seen in the
+// wild once, for per-layer lists; nothing needs eight, and eight is
+// small enough that the recursion cannot exhaust a stack and large
+// enough that no honest file meets it.
+pub fn max_array_depth() -> Int
+    todo("gguf-nv.ggufval.max_array_depth")
+
+// The declared type of a value: what `ggufwrite` will write it as.
+//
+// `GgufTypeArray` for a list, whatever `kind` says for a number or a
+// real, `GgufTypeBool` for a flag and `GgufTypeString` for text.
+pub fn value_kind(v: GgufValue) -> GgufValueType
+    todo("gguf-nv.ggufval.value_kind")
+
+// How deep this value nests: 0 for anything but a list, and one more
+// than its deepest item for a list.
+//
+// The check `ggufread` makes as it builds a value, and public because
+// a tool writing a GGUF should make it before it writes one rather
+// than after some other reader refuses the result.
+pub fn value_depth(v: GgufValue) -> Int
+    todo("gguf-nv.ggufval.value_depth")
+
+// How many bytes this value occupies in a file of this version,
+// INCLUDING its type tag and, for a list, the element type and count.
+//
+// What `ggufwrite.index_bound` sums.  It depends on the version
+// because every string length and every array count is four bytes in
+// version 1 and eight in 2 and 3.
+pub fn encoded_bytes(v: GgufValue, version: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufval.encoded_bytes")
+
+// How many bytes the whole entry occupies: the key's length field, the
+// key's bytes, the type tag, and the value.
+pub fn kv_bytes(kv: GgufKv, version: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufval.kv_bytes")
+
+// The number, for any of the eight integer widths, and `None` for
+// everything else.
+//
+// A bool is NOT an integer here: a caller that asked for a number and
+// got a flag has a bug in its key table, and answering 1 would hide
+// it.  `as_bool` is the call for a flag.
+//
+// ```novo
+// use ggufval
+//
+// fn main() [io]
+//     match ggufval.as_int(GgufNum(GgufTypeUint32, 32))
+//         Some(n) => println("${n}")
+//         None    => println("not a number")
+// ```
+pub fn as_int(v: GgufValue) -> ?Int
+    todo("gguf-nv.ggufval.as_int")
+
+// The number, for Float32 or Float64, and `None` for everything else.
+//
+// An integer value does NOT convert here, for the reason above: a key
+// declared UINT32 that a caller reads as a float is a key it has
+// misidentified, and a silent widening would make the mistake
+// permanent.
+pub fn as_float(v: GgufValue) -> ?Float
+    todo("gguf-nv.ggufval.as_float")
+
+// The flag, and `None` for everything else.
+pub fn as_bool(v: GgufValue) -> ?Bool
+    todo("gguf-nv.ggufval.as_bool")
+
+// The string, and `None` for everything else.
+pub fn as_str(v: GgufValue) -> ?Str
+    todo("gguf-nv.ggufval.as_str")
+
+// The items, and `None` for everything else.
+//
+// The element type is not returned: a caller that wants it has
+// `value_kind` on any item, or `ggufmeta.list_at`, which answers both.
+pub fn as_list(v: GgufValue) -> ?[GgufValue]
+    todo("gguf-nv.ggufval.as_list")
+
+// The items of a list of strings, and `None` when the value is not a
+// list or any item is not text.
+//
+// The shape every tokenizer key has — `tokenizer.ggml.tokens` and
+// `tokenizer.ggml.merges` are both arrays of string, and between them
+// they are most of the bytes in the metadata table of a real
+// checkpoint.
+pub fn as_str_list(v: GgufValue) -> ?[Str]
+    todo("gguf-nv.ggufval.as_str_list")
+
+// The items of a list of any integer width, and `None` otherwise.
+//
+// `tokenizer.ggml.token_type` is one, and so is every per-layer
+// hyperparameter list.  The widths may not be mixed — an array is
+// homogeneous — so a list that answers here answers wholly.
+pub fn as_int_list(v: GgufValue) -> ?[Int]
+    todo("gguf-nv.ggufval.as_int_list")
+
+// The items of a list of Float32 or Float64, and `None` otherwise.
+//
+// `tokenizer.ggml.scores` is the one that matters, and it is as long
+// as the vocabulary.
+pub fn as_float_list(v: GgufValue) -> ?[Float]
+    todo("gguf-nv.ggufval.as_float_list")
+
+// A value printed the way a `gguf dump` tool prints it: the number, the
+// string in quotes, or `[n items of <type>]` for a list.
+//
+// A list is summarised rather than expanded, and that is deliberate:
+// `tokenizer.ggml.tokens` on a Llama-3 checkpoint is 128,256 strings,
+// and a dump that printed them is a dump nobody reads twice.
+// `as_str_list` is there for a caller that wants them.
+pub fn describe(v: GgufValue) -> Str
+    todo("gguf-nv.ggufval.describe")

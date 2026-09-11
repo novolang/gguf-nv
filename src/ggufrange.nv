@@ -1,0 +1,141 @@
+// ggufrange.nv — the type that makes this package sans-IO: a place in a
+// model file, said out loud.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SHAPE, AND WHY IT IS THIS ONE
+//
+// `gguf-nv` is a `core` package, so its budget is no effects at all: it
+// cannot open a file, seek in one or map one.  A GGUF is also the one
+// model format where that is a gift rather than a tax, because a GGUF
+// is an INDEX — a header, a metadata table, a tensor-info table, and
+// then a blob whose contents are addressed by offset — and a loader
+// wants exactly one tensor at a time out of a file that does not fit in
+// memory.
+//
+// So every answer this package gives about WHERE something is, is a
+// `GgufRange`, and it means both directions at once:
+//
+//   - to a caller that mapped the whole file, it is a SPAN into the
+//     buffer it handed over, and `ggufrange.slice` cuts it out;
+//   - to a caller that mapped none of it — a loader streaming a 40 GB
+//     checkpoint into VRAM a tensor at a time — it is a REQUEST: read
+//     these `len` bytes at this `at` and hand them back.
+//
+// `docs/publishing.md` § How a `core` package takes bytes from its host
+// calls the second one "the core asks, the host performs", and lists it
+// as the right shape for an indexed format that streaming would throw
+// away.  Both are exercised here: `gguffile.parse` is the first, and
+// `ggufread.need` through `ggufinfo.tensor_range` is the second.
+//
+// ELF-NV'S SHAPE IS THE HOUSE STYLE, AND THE TYPE IS STILL OURS.
+// `elf-nv` answers about a firmware image with an `ElfRange` for the
+// same reason, and this package copies the shape deliberately so that a
+// reader who has met one meets no surprise in the other.  What it does
+// not do is depend on it: struct identity is keyed by name across an
+// assembly, the two formats share nothing but the idea, and a model
+// loader downloading an ELF reader to get a pair of integers would be
+// a dependency nobody asked for.
+//
+// WHY NOT A SLICE TYPE THAT BORROWS
+//
+// Because a borrow would tie the range to the buffer it came from, and
+// the interesting caller here has no buffer at all.  A range is two
+// integers; it survives being written to a manifest, sent to a GPU
+// upload queue, or held while the bytes it describes are on a disk.
+
+// GgufRange is `len` bytes starting at `at`, counted from the first
+// byte of the FILE.
+//
+// Always from the file, never from the start of the tensor data:
+// `ggufinfo` adds the data-blob origin before it answers, because the
+// origin is a fact the index knows and the caller should not have to.
+// The tensor-info table's own `offset` field is the relative one, and
+// it is kept relative on `GgufTensorInfo` so that a round trip through
+// `ggufwrite` writes back what was read.
+pub struct GgufRange
+    // Byte offset from the start of the file.  Never negative.
+    at: Int
+    // Byte count.  Zero is ordinary — a metadata array of no elements
+    // and a tensor with a zero dimension both occupy no bytes, and
+    // their range is the empty one at the offset the table gave.
+    len: Int
+
+// range is `len` bytes at `at`.
+//
+// ```novo
+// use ggufrange
+//
+// fn main() [io]
+//     let r = ggufrange.range(24, 4096)
+//     println("${r.len} bytes at ${r.at}")
+// ```
+pub fn range(at: Int, len: Int) -> GgufRange
+    todo("gguf-nv.ggufrange.range")
+
+// empty is the zero-length range at `at`.
+//
+// Named rather than left to `range(at, 0)` because an empty metadata
+// array is common in real checkpoints — `tokenizer.ggml.merges` on a
+// SentencePiece model is the usual one — and a reader that meets one
+// should see what it is.
+pub fn empty(at: Int) -> GgufRange
+    todo("gguf-nv.ggufrange.empty")
+
+// range_end is the offset one past the last byte, which is `at + len`.
+pub fn range_end(r: GgufRange) -> Int
+    todo("gguf-nv.ggufrange.range_end")
+
+// range_fits says whether the whole range is inside a file of `total`
+// bytes.
+//
+// The check every offset field gets before it is believed.  A
+// tensor-info entry is a name and four numbers a quantiser wrote, and
+// nothing in the format stops it naming bytes past the end of the
+// file — a truncated download is exactly that, and it is the single
+// most common damaged GGUF.
+pub fn range_fits(r: GgufRange, total: Int) -> Bool
+    todo("gguf-nv.ggufrange.range_fits")
+
+// slice cuts the range out of an image the caller holds.
+//
+// The convenience half of the type, for the caller that DID map the
+// whole file.  It copies: novo-lang has no borrowing slice, so the
+// alternative to a copy is the range itself, which is why the range is
+// what every other function here returns.
+//
+// A range that does not fit is `GgufTruncated` with all three numbers,
+// rather than a short read — a caller that got fewer bytes than it
+// asked for and was not told is a caller that parses garbage and blames
+// the model.
+pub fn slice(image: Bytes, r: GgufRange) -> Result<Bytes, GgufFault>
+    todo("gguf-nv.ggufrange.slice")
+
+// sub is the range of `len` bytes at `offset` INSIDE `r`, expressed
+// back in the file's own coordinates.
+//
+// The arithmetic a caller reading in ranges gets wrong once: it has the
+// metadata table's bytes in a buffer of its own, it wants the third
+// key's value, and the offset it must report in an error is the file's,
+// not the buffer's.  Doing it here means doing it once.
+pub fn sub(r: GgufRange, offset: Int, len: Int) -> Result<GgufRange, GgufFault>
+    todo("gguf-nv.ggufrange.sub")
+
+// join is the smallest range covering both.
+//
+// What a loader building an upload plan wants: two tensors that happen
+// to be adjacent in the file are one read, and this is the test for
+// whether merging them costs anything — `join(a, b).len` against
+// `a.len + b.len` is the padding that would come along.
+pub fn join(left: GgufRange, right: GgufRange) -> GgufRange
+    todo("gguf-nv.ggufrange.join")
+
+// overlaps says whether the two ranges share a byte.
+//
+// A tensor-info table is a list of offsets a writer chose, and nothing
+// checks them against each other; two tensors claiming one byte is a
+// file that will load and produce nonsense.  `ggufinfo.check_layout`
+// uses this, and it is public because a tool writing a GGUF wants the
+// same check before it does.
+pub fn overlaps(left: GgufRange, right: GgufRange) -> Bool
+    todo("gguf-nv.ggufrange.overlaps")

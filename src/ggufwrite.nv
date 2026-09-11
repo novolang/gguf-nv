@@ -1,0 +1,209 @@
+// ggufwrite.nv — the writer: a header and two tables assembled into
+// bytes the caller then puts somewhere.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE WRITER WRITES AN INDEX AND NOT A FILE.  It produces the bytes
+// from offset 0 up to the start of the data blob, padding included, and
+// stops.  The weights are the caller's: it appends them, streams them,
+// copies them from the file it is rewriting, or generates them — and
+// none of that is something a `core` package could do or should
+// decide.
+//
+// That split is what makes the interesting operation cheap.  Changing a
+// chat template on a 40 GB checkpoint is: read the index, edit one
+// metadata value, ask this module for the new index bytes, and copy the
+// blob across.  The blob is copied because the index's length changed
+// and every tensor moved — but nothing was decoded, nothing was
+// requantised, and the index is a few hundred kilobytes.
+//
+// FEED AND DRAIN, INTO THE CALLER'S BUFFER.  `writer` opens, `push_kv`
+// and `push_tensor` take one entry each, and `finish` produces the
+// bytes.  Two things follow from the format that a caller should know
+// before it starts:
+//
+//   - THE COUNTS ARE IN THE HEADER, so nothing can be emitted until
+//     every entry has been pushed.  The writer accumulates and `finish`
+//     lays out; a streaming writer for this format cannot exist without
+//     seeking backwards, which a `core` package has no way to do.
+//   - THE TENSOR OFFSETS ARE THE CALLER'S OR THE WRITER'S, and
+//     `pack_offsets` is the switch.  A caller rewriting a file keeps
+//     the offsets it read; a caller building one asks for them to be
+//     assigned in push order, each aligned.
+//
+// `index_bound` is the exact byte count, not an upper bound, because
+// every field's width is known from the entries — so a caller sizing a
+// buffer gets the number rather than a guess with slack in it.
+
+// A writer that has been told the version and the alignment and is
+// waiting for entries.
+//
+// The fields are public for the same reason `GgufReader`'s are: a
+// value with nothing hidden is a value a reader of this package can
+// check the arithmetic of, and copying one is free.
+pub struct GgufWriter
+    // Which version to emit.  `ggufhdr.latest_version` unless the
+    // caller is deliberately producing a version 1 or 2 file.
+    version: Int
+    // Which byte order to emit.  `GgufLittleEndian` unless the caller
+    // is deliberately producing a big-endian file, which requires
+    // version 3.
+    order: GgufByteOrder
+    // The alignment tensor offsets are multiples of, and the blob's
+    // own start.  Written into the file as `general.alignment` by
+    // `finish` when it is not 32, and left out when it is — a file
+    // that declares the default is a file that differs from what
+    // llama.cpp writes for no reason.
+    alignment: Int
+    // Whether `finish` assigns the tensor offsets itself, in push
+    // order and each aligned, rather than keeping the ones on the
+    // entries.
+    pack_offsets: Bool
+    // The metadata entries, in push order, which is the order they
+    // will be written in.
+    entries: [GgufKv]
+    // The tensor-info entries, in push order.
+    tensors: [GgufTensorInfo]
+
+// A writer for this version, this byte order and this alignment.
+//
+// `GgufUnsupportedVersion` for a version outside 1, 2 and 3, and for
+// `GgufBigEndian` below version 3 — big-endian is a version 3 addition
+// and a version 2 file that claimed it could not be read by anything.
+// `GgufBadAlignment` for an alignment that is not a positive power of
+// two.
+//
+// ```novo
+// use ggufwrite
+// use ggufhdr
+//
+// fn main() [io]
+//     match ggufwrite.writer(3, GgufLittleEndian, 32, false)
+//         Ok(w)  => println("${w.version}")
+//         Err(f) => println(f.message())
+// ```
+pub fn writer(version: Int, order: GgufByteOrder, alignment: Int,
+              pack_offsets: Bool) -> Result<GgufWriter, GgufFault>
+    todo("gguf-nv.ggufwrite.writer")
+
+// The writer a tool that is not making choices wants: version 3,
+// little-endian, alignment 32, offsets assigned by the writer.
+pub fn default_writer() -> GgufWriter
+    todo("gguf-nv.ggufwrite.default_writer")
+
+// A writer set up to rewrite this index: its version, its byte order,
+// its alignment, and its tensor offsets kept as they are.
+//
+// The starting point for "change one key and put the file back
+// together".  The entries and the tensors are already pushed, so a
+// caller that changes nothing and calls `finish` gets the same bytes
+// it read — and that identity is a test in the suite rather than an
+// aspiration, because a round trip that is not exact is a round trip
+// that silently rewrites files.
+pub fn rewriter(ix: GgufIndex) -> Result<GgufWriter, GgufFault>
+    todo("gguf-nv.ggufwrite.rewriter")
+
+// Append one metadata entry.
+//
+// `GgufArrayTooDeep` when the value nests past `ggufval.max_array_depth`,
+// and `GgufCountOverflow` when a string or an array is longer than the
+// version's length field can express — a version 1 file cannot carry a
+// string of five billion bytes, and finding that out at `finish` would
+// be finding it out after the caller pushed a hundred thousand tokens.
+pub fn push_kv(w: GgufWriter, kv: GgufKv) -> Result<GgufWriter, GgufFault>
+    todo("gguf-nv.ggufwrite.push_kv")
+
+// Append several metadata entries, in order.
+pub fn push_kvs(w: GgufWriter, kvs: [GgufKv]) -> Result<GgufWriter, GgufFault>
+    todo("gguf-nv.ggufwrite.push_kvs")
+
+// Replace the value under a key, or append the entry when the key is
+// absent.
+//
+// The call the chat-template rewrite is: `set_kv(w,
+// ggufmeta.key_chat_template(), GgufText(template))`.  Replacing keeps
+// the key's POSITION in the table, so a file whose only change is one
+// value has its entries in the same order it had them.
+pub fn set_kv(w: GgufWriter, key: Str, value: GgufValue) -> Result<GgufWriter, GgufFault>
+    todo("gguf-nv.ggufwrite.set_kv")
+
+// Drop the entry under a key, if there is one.
+//
+// Answers the writer unchanged when there is not, rather than a fault:
+// a caller stripping four optional keys from a file should not have to
+// know which of them were there.
+pub fn drop_kv(w: GgufWriter, key: Str) -> GgufWriter
+    todo("gguf-nv.ggufwrite.drop_kv")
+
+// Append one tensor-info entry.
+//
+// `ggufinfo.validate` against the writer's alignment, so a rank, a
+// ragged row or a misaligned offset is refused where the caller can
+// still see which tensor it pushed.  With `pack_offsets` set the entry's
+// own offset is ignored and the alignment check is skipped, because
+// the writer is about to assign an aligned one.
+pub fn push_tensor(w: GgufWriter, info: GgufTensorInfo) -> Result<GgufWriter, GgufFault>
+    todo("gguf-nv.ggufwrite.push_tensor")
+
+// Append several tensor-info entries, in order.
+pub fn push_tensors(w: GgufWriter, infos: [GgufTensorInfo]) -> Result<GgufWriter, GgufFault>
+    todo("gguf-nv.ggufwrite.push_tensors")
+
+// Exactly how many bytes `finish` will produce.
+//
+// The header, both tables, and the padding up to the alignment.  Exact
+// rather than an upper bound: every field's width follows from the
+// version and from the entries themselves, so there is nothing to
+// round up.  A caller preallocating a buffer or reserving space in a
+// file gets the number.
+//
+// ```novo
+// use ggufwrite
+//
+// fn main() [io]
+//     match ggufwrite.index_bound(ggufwrite.default_writer())
+//         Ok(n)  => println("${n}")
+//         Err(f) => println(f.message())
+// ```
+pub fn index_bound(w: GgufWriter) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufwrite.index_bound")
+
+// Where the data blob will start, which is `index_bound` — the padding
+// is part of what `finish` emits.
+//
+// Named separately because that identity is not obvious and a caller
+// that computed the blob's start from the table's end instead would be
+// short by up to `alignment - 1` bytes.
+pub fn data_at(w: GgufWriter) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufwrite.data_at")
+
+// The offsets `finish` will assign, in push order, when `pack_offsets`
+// is set — and the entries' own offsets when it is not.
+//
+// What a caller needs BEFORE it starts copying weights: it has to know
+// where each tensor goes in the blob, and asking after `finish` would
+// mean holding the whole plan twice.
+pub fn planned_offsets(w: GgufWriter) -> Result<[Int], GgufFault>
+    todo("gguf-nv.ggufwrite.planned_offsets")
+
+// The index's bytes: header, metadata table, tensor-info table,
+// padding.
+//
+// What the caller writes at offset 0.  The weights follow, each at its
+// planned offset counted from the end of these bytes.
+pub fn finish(w: GgufWriter) -> Result<Bytes, GgufFault>
+    todo("gguf-nv.ggufwrite.finish")
+
+// The index's bytes written into a buffer the caller sized.
+//
+// `GgufOutputFull` with both numbers when `room` is smaller than
+// `index_bound`, and the count written when it is not.  For a caller
+// that has already reserved the space — a preallocated file, a
+// memory-mapped region, a device's staging buffer — and does not want
+// a second copy of a few hundred kilobytes.
+//
+// `into` is the caller's buffer and the result is the number of bytes
+// placed at its start; the buffer is not resized and nothing past that
+// count is touched.
+pub fn write_into(w: GgufWriter, into: Bytes, room: Int) -> Result<Int, GgufFault>
+    todo("gguf-nv.ggufwrite.write_into")
