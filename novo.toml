@@ -1,6 +1,6 @@
 [package]
 name        = "gguf-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The GGUF model file, read with no file in it: the header in both byte orders and all three versions, the metadata key/value table with every value type and arrays nested to any depth, the tensor-info table with the alignment rule, and the GGML block layouts — F32 through Q8_1, the K-quants and the IQ family — as values giving elements-per-block and bytes-per-block, so a caller can slice one tensor's bytes out of a 40 GB file without decoding any of it.  Every answer about WHERE something is comes back as a byte range.  Dequantisation is deliberately not here.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

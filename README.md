@@ -1,288 +1,343 @@
 # gguf-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+GGUF is a file format for storing models for inference with GGML and
+executors based on it. It is a single file that carries a model's weights
+and everything needed to load them, and it is the format llama.cpp and
+Ollama distribute. The format is
+[specified by the ggml project](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).
+This package reads a GGUF's index in novo-lang, with no file in it: it
+answers what is in the file and where each tensor's bytes are, and the
+caller does the reading.
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What a GGUF is
 
-A **GGUF model file, read with no file in it**.  The header, the
-metadata key/value table, the tensor-info table, and — the part nothing
-else gives you — the GGML block layouts as numbers, so that a caller can
-work out exactly which bytes of a 40 GB checkpoint one tensor occupies
-and read only those.
+A GGUF has four parts in this order. The **header** is the four characters
+`GGUF`, a version number, and how many entries each of the two tables that
+follow holds. The **metadata table** is a list of key/value pairs: the
+architecture, the hyperparameters, the vocabulary, the chat template. The
+**tensor-info table** is one entry per tensor, giving its name, its
+dimensions, its type and where its data begins. The **data blob** is every
+tensor's bytes, one after another.
 
-Nine modules, and no dependencies.
+The header and the two tables together are the **index**. On a 40 GB
+checkpoint the index is a few hundred kilobytes. Everything this package
+answers comes out of it.
 
-| surface | module | reach for it when |
-| --- | --- | --- |
-| the **index** | `ggufread` | you have a file and want to know what is in it |
-| the **block layouts** | `ggufquant` | you are sizing, slicing or reporting a quantised tensor |
-| the **tensor table** | `ggufinfo` | you want one tensor's bytes |
-| the **metadata** | `ggufmeta` | you want a hyperparameter, a vocabulary or a chat template |
-| the **values** | `ggufval` | you are reading or building a metadata value by hand |
-| the **header** | `ggufhdr` | you are sniffing a file, or aligning something |
-| the **place** | `ggufrange` | you are doing your own reads |
-| the **writer** | `ggufwrite` | you are putting a file back together |
-| the **faults** | `gguferr` | you are telling somebody why their model did not load |
+A tensor's numbers are usually **quantised**: stored in fewer bits than a
+float, in fixed-size groups called **blocks**. A block holds a fixed number
+of weights and occupies a fixed number of bytes, and the two numbers are
+what decide where a tensor ends. The original family works 32 weights at a
+time with one scale for the group. The **K-quants** and the **IQ** family
+work 256 weights at a time with a hierarchy of scales: one for the
+superblock and sixteen or eight for the sub-blocks, packed six bits each.
+A row's length must be a multiple of the block's weight count.
 
-## Adding it, and checking it
+The **alignment** is the number the data blob's start is rounded up to, and
+it is `general.alignment` in the metadata or 32 when that key is absent.
+Every tensor's offset in the tensor-info table is counted from the start of
+the data blob, not from the start of the file.
 
-```bash
-novo pkg add gguf-nv              # into your novo.toml
-novo pkg build                    # type- and effect-check the package
-novo test --isolate tests/ggufquant_tests.nv
+Every answer this package gives about where something is, is a
+**`GgufRange`**: a byte offset counted from byte 0 of the file, and a byte
+count. To a caller that mapped the whole file it is a span, and
+`ggufrange.slice` cuts it out. To a caller that mapped none of it, it is a
+request: read these bytes at this offset.
+
+This package performs no input or output. It opens no file, seeks in none
+and maps none. The one exception is `ggufread.read_index`, which takes a
+source the caller supplies and is charged whatever that source costs.
+
+| Quantity | Value |
+| --- | --- |
+| Magic, at offset 0 | the four characters `GGUF` |
+| Versions this package reads | 1, 2, 3 |
+| Header size, version 1 | 16 bytes |
+| Header size, versions 2 and 3 | 24 bytes |
+| Count and length width, version 1 | 4 bytes |
+| Count and length width, versions 2 and 3 | 8 bytes |
+| Default alignment | 32 bytes |
+| Metadata value types | 13 |
+| Maximum tensor rank | 4 |
+| Array nesting this package allows | 8 levels |
+
+Two examples of the block arithmetic, from `ggml-common.h`:
+
+| Type | Weights per block | Bytes per block | The sum |
+| --- | --- | --- | --- |
+| `GgufQ4_0` | 32 | 18 | 2 + 16 |
+| `GgufQ4_K` | 256 | 144 | 2 + 2 + 12 + 128 |
+
+A Q4_K tensor of 4096 by 4096 is 4096 rows of 16 blocks of 144 bytes, which
+is 9,437,184 bytes. It is neither 8 MB nor 12 MB, and a loader that
+computed it either of those ways reads the next tensor's bytes as the end
+of this one.
+
+## Install
+
+```
+novo pkg add gguf-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: gguf-nv.<module>.<fn>`.  They
-turn green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
 use std.bytes
 use ggufread
+use ggufmeta
 
 fn main() [io]
-    match ggufread.parse_index(bytes.zeros(0))
-        Err(f)  => println(f.message())
-                   // : not a GGUF file: first four bytes read 0
-        Ok(ix)  => println("${ix.header.tensor_count} tensor(s)")
+    // The whole file in memory. A caller that cannot hold a 40 GB
+    // checkpoint uses `reader`, `need` and `offer` instead.
+    let image = bytes.zeros(0)
+
+    match ggufread.parse_index(image)
+        Err(f) => println(f.message())
+        Ok(ix) =>
+            // What the file says it is. The architecture name prefixes
+            // every hyperparameter key in the metadata table.
+            match ggufmeta.architecture(ix.meta)
+                Err(f)   => println(f.message())
+                Ok(arch) => println("${arch}: ${ix.header.tensor_count} tensor(s)")
+
+            // Where one tensor's bytes are, counted from byte 0 of the
+            // file. Reading them is the caller's work.
+            match ggufread.tensor_range(ix, "token_embd.weight")
+                Err(f) => println(f.message())
+                Ok(r)  => println("${r.len} bytes at ${r.at}")
 ```
 
-## The load-bearing interface
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a `not implemented: gguf-nv.<module>.<fn>`
+panic. The tests are the specification the implementation will have to
+satisfy.
 
-Two of them, and the first is what makes the package possible at all.
+## What the package contains
 
-### `ggufread.need` and `ggufread.offer` — the core asks, the host performs
-
-```novo norun:pseudo
-var r = ggufread.reader()
-loop
-    if ggufread.is_done(r)
-        break
-    let want = ggufread.need(r)             // a GgufRange: at, len
-    r = ggufread.offer(r, host_read(want))!
-let ix = ggufread.index_of(r)!
-```
-
-A `core` package's budget is no effects at all, so it may not open a
-file, seek in one or map one.  A GGUF's index also cannot be read in one
-go: **nothing in the format records where the metadata table ends.**  A
-reader learns that only by walking it — key, type tag, value, repeat,
-`metadata_kv_count` times — and one of those values may be a
-128,256-element array of strings.  So neither "hand me the whole file"
-nor "hand me the first N bytes" is a contract a caller can keep in
-advance.
-
-So the reader **asks**.  Four functions, and the host's loop is the six
-lines above whether the host is an mmap, a file descriptor, an HTTP
-range request against a model repository, or a device reading external
-flash.  `docs/publishing.md` § How a `core` package takes bytes from its
-host calls this "the core asks, the host performs" and lists it as the
-right shape for an indexed format that streaming would throw away.
-
-The reader never holds the file.  A 40 GB checkpoint goes through it in
-a few hundred kilobytes of asks, because the only bytes it ever sees are
-the index.
-
-`ggufread.read_index` is the same machine with the pump written once,
-for the caller whose source is sequential:
-
-```novo norun:pseudo
-pub fn read_index<S: Read[e]>(src: S) -> Result<GgufIndex, GgufFault> [e]
-```
-
-The bound binds `Read`'s effect parameter and the clause uses it
-(SPEC § 5.6), so the row means "whatever the impl behind `S` supplies" —
-`[io]` for a file, `[io, net]` for a socket, nothing for an in-memory
-buffer — and the package stays `core`.  It is the only effect row in
-gguf-nv, and it spends nothing.
-
-### `ggufquant.block_elements` and `ggufquant.block_bytes` — two numbers per type
-
-```novo norun:pseudo
-pub fn block_elements(t: GgufType) -> Int      // 1, 32 or 256
-pub fn block_bytes(t: GgufType) -> Int         // Q4_K: 144
-```
-
-This is what the package exists for.  Everything else here reads a
-table; this is the part a caller cannot derive, cannot guess, and gets
-wrong in a way that produces a model which loads and speaks nonsense.
-
-A Q4_K tensor of 4096 by 4096 is not 8 MB and it is not 12 MB.  It is
-4096 rows of 16 blocks of 144 bytes — **9,437,184** — and a loader that
-computed it any other way reads the next tensor's bytes as the end of
-this one.  Everything above it follows: `row_bytes`, `tensor_bytes`,
-`block_range`, and every `GgufRange` in the package.
-
-Two block sizes cover every quantised type.  The original Q4_0 family
-works **32** weights at a time with one scale each; the K-quants and the
-IQ family work **256** at a time with a scale hierarchy — a
-per-superblock scale and sixteen or eight sub-block ones packed six bits
-each.  That is why a row length must be a multiple of the block size,
-and why a Q4_K tensor whose first dimension is 100 does not exist.
-
-## Dequantisation is not here, and that is the split with `ml`
-
-`orbit/ml` is the native inference engine this row was cut from, and the
-split is clean because the two halves never needed each other's code:
-
-| | |
+| Module | Contents |
 | --- | --- |
-| **ml keeps** | the dequantisation kernels — the CUDA and ROCm mat-vecs, the upload-time quantiser that turns BF16 weights into blocks — and the device dispatch that chooses between CPU, CUDA and ROCm |
-| **ml would take from gguf-nv** | the header and both tables, the type codes, and the two block numbers |
+| `ggufhdr` | The header: the magic, the version, the byte-order test, the two count widths, and the alignment rule. |
+| `ggufval` | The thirteen metadata value types, a value as a novo-lang value, and one key/value entry. |
+| `ggufmeta` | The metadata table: lookup by key at a type, the named keys every model declares, and the architecture-scoped key names. |
+| `ggufinfo` | One tensor's entry: its rank, its element and row counts, its size in bytes, and the range its data occupies. |
+| `ggufquant` | Every GGML tensor type, with the weights per block and the bytes per block that size a tensor. |
+| `ggufrange` | A byte offset and a byte count, and the arithmetic over them: slicing, joining, containment and overlap. |
+| `ggufread` | Reading an index: the asking reader, the whole-image form, the sequential form, and the index they all answer. |
+| `ggufwrite` | Writing an index back: entries in, tensor entries in, the planned offsets out, and the bytes of the index. |
+| `gguferr` | What a file could not be read as, with the offset, count, code or key that says why. |
 
-Today ml reads **safetensors**, not GGUF: `ml/src/ml/loader.nv` walks a
-HuggingFace checkpoint directory, and `ml/src/ml/gate.nv` refuses a
-pre-quantised repository by name and tells the user to fetch the
-unquantised one.  Taking gguf-nv is what would let it open the files
-most people actually have, and it needs nothing from this package but
-the index and the block sizes — it already owns every kernel.
+## How to choose an entry point
 
-**The number that makes the split worth stating out loud**: ml's own
-Q4_K-*style* supergroup is **168 bytes** over 256 weights (8 + 32 + 128,
-in `ml/backend/common/mlkern.cu`), and GGML's `block_q4_K` is **144**
-over the same 256.  They are different formats with similar names.  The
-only way that stays visible is for the file format's numbers to live in
-the file format's package, with the file format's spelling on them —
-which is this package, and which is why `ggufquant` publishes
-`is_file_type`, `withdrawn_name` and a type histogram rather than a
-single "bytes per weight" that would blur the two.
+There are three ways to get an index, and they differ in who reads the
+bytes.
 
-## Every answer about a position is a range
+**`ggufread.parse_index` takes the whole file.** Use it for a small model,
+a memory-mapped file, or a test.
 
-```novo norun:pseudo
-pub struct GgufRange
-    at: Int       // from byte 0 of the FILE
-    len: Int
+**`ggufread.read_index` takes a source that can go forwards.** The header
+and both tables are contiguous from byte 0, so a sequential source is
+enough. It costs whatever the source costs: nothing for a buffer, `[io]`
+for a file, `[io, net]` for a socket.
+
+**`ggufread.reader`, `need`, `offer` and `index_of` ask for bytes.** The
+reader answers a range, the caller reads exactly those bytes and hands them
+back, and the loop repeats until `is_done`. Use it when the source is an
+HTTP range request, an accelerator's upload queue, or anything else that is
+not a stream. Nothing in the format records where the metadata table ends,
+so neither "the whole file" nor "the first N bytes" is a promise a caller
+could keep in advance.
+
+For a tensor's bytes there are two ways in. **`ggufread.tensor_range` takes
+the index and a name** and answers the range, which is what a loader wants.
+**`ggufinfo.tensor_range` takes one entry and the blob's start**, for a
+caller holding entries it filtered or sorted itself.
+`ggufinfo.row_range` and `ggufquant.block_range` are the same question at
+a finer grain.
+
+For a metadata value there are three. `ggufmeta.int_at` and its four
+siblings answer a `Result` that names the key and both type names when the
+type is wrong. `ggufmeta.int_or` and its siblings answer a fallback
+instead. `ggufmeta.find` answers the raw `GgufValue` for a caller that will
+match on it.
+
+## The rules a user needs
+
+1. **The magic does not say which byte order the file is in.** The four
+   bytes are `GGUF` in file order in both. The version field decides: a
+   version whose low sixteen bits are zero was read backwards, because no
+   real version is a multiple of 65536. `ggufhdr.detect_order` is that
+   test, and it is the reference implementation's own.
+2. **Version 1 writes 32-bit counts and versions 2 and 3 write 64-bit
+   ones.** The same widening applies to every string length and every array
+   length in the tables. `ggufhdr.count_width` is the one place that fact
+   lives.
+3. **A tensor entry's offset is relative to the data blob and a
+   `GgufRange` is absolute.** `GgufTensorInfo.offset` keeps the number the
+   file stored, so a round trip through `ggufwrite` writes back what was
+   read. Every function that answers a position adds the blob's start. A
+   reader that mixes the two gets its first tensor right and its last one
+   wrong by megabytes.
+4. **The data blob starts at the first multiple of the alignment after the
+   tensor-info table.** The alignment is `general.alignment` or 32.
+   `GgufIndex.alignment` and `GgufIndex.data_at` are both resolved when the
+   index is parsed, because every tensor range depends on them.
+5. **A tensor's size is blocks, not bits per weight.**
+   `ggufquant.block_elements` and `ggufquant.block_bytes` are the two
+   numbers, and `row_bytes`, `tensor_bytes` and `block_range` are built on
+   them. `bits_per_weight` is for reporting and is not the way to size
+   anything.
+6. **A row's length must be a multiple of the block's weight count.** A
+   Q4_K tensor whose first dimension is 100 does not exist, because 100 is
+   not a multiple of 256.
+7. **The architecture prefixes its own keys.** A Llama model's layer count
+   is `llama.block_count` and a Qwen2 model's is `qwen2.block_count`, so a
+   reader reads `general.architecture` first and builds every other key
+   name from it. `ggufmeta.arch_key` is that concatenation, and the eight
+   named helpers over it cover the hyperparameters every decoder-only
+   architecture declares.
+8. **`general.file_type` is a hint and not a fact.** It names what the
+   quantiser was asked for. The tensor-info table names what each tensor
+   actually is, and a mixed quantisation makes the two disagree by design.
+   `ggufinfo.type_histogram` is what shows a user that a `Q4_K_M` file is
+   four different quantisations, which it is.
+9. **An unknown metadata value-type code stops the read.** The format has
+   thirteen, and a value whose length this reader cannot compute is a value
+   it cannot step over. `GgufBadValueType` carries the code.
+10. **Five tensor type codes were withdrawn from the format.** A file that
+    uses one cannot be read. `ggufquant.withdrawn_codes` lists them and
+    `withdrawn_name` gives the name, so the message says which type rather
+    than reporting an unknown number.
+11. **`GgufQ8_K` and `GgufQ8_1` are runtime types and are not written to
+    files.** `ggufquant.is_file_type` is the predicate. A tensor declaring
+    one is a file something built wrong.
+12. **A duplicated metadata key answers its first entry.**
+    `ggufmeta.duplicates` lists every key that appears more than once, so a
+    tool can report the file rather than being refused it.
+13. **An array may hold arrays, and the format bounds the nesting at
+    nothing.** This package bounds it at `ggufval.max_array_depth`, which
+    is eight, and answers `GgufArrayTooDeep` past it. Without a bound a
+    file could ask a reader for a stack overflow.
+14. **A 64-bit unsigned value with its top bit set does not fit.**
+    novo-lang's `Int` is signed. `GgufTypeUint64` is the one metadata type
+    whose full range does not fit, and such a value is
+    `GgufUnsignedOverflow` rather than a negative number.
+15. **`offer` takes exactly the bytes `need` asked for.** A short chunk is
+    `GgufTruncated`, because a host that read fewer bytes than it asked for
+    has hit the end of the file. A longer chunk is refused too, because the
+    extra bytes have no position the reader can trust.
+16. **`ggufinfo.check_layout` is a separate call from parsing.** A damaged
+    checkpoint can be read and then be told it is damaged, which is what a
+    repair tool needs.
+17. **A misaligned tensor offset is refused.** llama.cpp reads one and
+    addresses it wrongly. `ggufinfo.validate` is the check.
+
+## What is not included
+
+- **Dequantisation.** This package gives the block layout as numbers. It
+  never turns a block back into weights, and it holds no tensor. An
+  inference engine owns its kernels, and it needs nothing from here but the
+  index and the two block numbers.
+- **The weights, in the writer.** `ggufwrite` emits the index only. A tool
+  editing a checkpoint's metadata copies the data blob through unchanged.
+- **A tensor type.** `GgufTensorInfo` carries a name, dimensions, a type
+  code and an offset. What the numbers mean is the caller's.
+- **safetensors.** `std.safetensors` in the standard library reads that
+  format.
+- **A microcontroller build.** No module here is declared to build for a
+  device with no heap allocator. A GGUF is addressed by 64-bit offsets into
+  a file measured in gigabytes.
+
+## Related packages
+
+- [embeddings-nv](https://novo-lang.org/packages/embeddings-nv) is the
+  arithmetic on what a model produced. The two packages sit at opposite
+  ends of an inference run and never meet.
+- [tokenizers-nv](https://novo-lang.org/packages/tokenizers-nv) builds a
+  tokenizer from a vocabulary. A GGUF's `tokenizer.ggml.*` keys are where
+  that vocabulary comes from, and `ggufmeta.key_tokens`,
+  `key_merges` and `key_token_type` name them.
+- [prompt-nv](https://novo-lang.org/packages/prompt-nv) renders a chat
+  template. `ggufmeta.chat_template` reads the one the file carries.
+- [ollama-nv](https://novo-lang.org/packages/ollama-nv) talks to a local
+  Ollama server, which serves GGUF files. It never reads one itself.
+- [elf-nv](https://novo-lang.org/packages/elf-nv) answers about a firmware
+  image with the same offset-and-length shape, so a reader who has met one
+  meets no surprise here. The two packages share the idea and no code.
+- `std.safetensors` in the standard library loads `.safetensors` weights
+  into tensors. It reads the other common checkpoint format, and it
+  produces tensors rather than byte ranges.
+- `std.hf` in the standard library fetches repository files from the
+  HuggingFace Hub into a revision-pinned cache, which is where a GGUF
+  usually comes from.
+- `std.llm` in the standard library runs inference. It is the consumer a
+  loader built on this package would feed.
+
+## Tests
+
+```bash
+novo test tests/ggufquant_tests.nv     #  8 tests: the type codes and the block sizes
+novo test tests/ggufindex_tests.nv     # 15 tests: the header, the tables and the ranges
+novo test tests/ggufsurface_tests.nv   #  7 tests: the rest of the public surface
 ```
 
-To a caller that mapped the whole file it is a **span**, and
-`ggufrange.slice` cuts it out.  To a caller that mapped none of it — a
-loader streaming a checkpoint into VRAM a tensor at a time — it is a
-**request**: read these bytes at this offset and hand them back.  One
-type for both, because they are one fact.
+The block sizes come from `ggml-common.h`, one struct per type, and each
+assertion writes out the sum rather than the total: `block_q4_K` is
+`ggml_half d` plus `ggml_half dmin` plus `uint8_t scales[12]` plus
+`uint8_t qs[128]`, which is 2 + 2 + 12 + 128. A wrong number is then
+visible as a wrong addition. The header, the value type codes, the string
+encoding, the tensor entry's field order, the maximum rank and the default
+alignment come from the GGUF specification.
 
-elf-nv's `ElfRange` is the house style and this is deliberately the same
-shape, so a reader who has met one meets no surprise in the other.  What
-this package does not do is depend on it: struct identity is keyed by
-name across an assembly, the two formats share nothing but the idea, and
-a model loader downloading an ELF reader to get a pair of integers would
-be a dependency nobody asked for.
+`gguf-py`'s `GGUFReader` is the oracle, and it arrives with the bodies: a
+set of small published checkpoints read with it and with this package,
+every key, every tensor offset and every size compared.
 
-**The offset on a tensor entry is relative and the range is absolute.**
-The file stores an offset counted from the start of the data blob, and
-`GgufTensorInfo.offset` keeps it that way so that a round trip through
-`ggufwrite` writes back the number that was read.  Every function that
-answers a *position* takes the blob's own start and returns a range
-counted from byte 0.  A reader that mixed them is a reader whose first
-tensor is correct and whose last one is megabytes wrong.
+The tests compile today and fail at run, each on the
+`not implemented: gguf-nv.<module>.<fn>` panic that is its body. That is
+the expected state of an interface release. They turn green one at a time
+as bodies land.
 
-## Three things about GGUF that surprise everyone
+## Implementation status
 
-**The magic does not tell you the byte order.**  The four bytes are
-`GGUF` in file order in a little-endian file and in a big-endian one
-alike, because they are written as characters rather than as a number.
-The **version** field decides it: a version whose low sixteen bits are
-zero was read backwards, because no real version is a multiple of 65536.
-That is `ggufhdr.detect_order`, and it is the reference implementation's
-own test.
+| Item | Implemented |
+| --- | --- |
+| `ggufhdr.magic_bytes`, `.magic_le`, `.magic_range`, `.version_range`, `.probe_range` | no |
+| `ggufhdr.parse_header`, `.is_gguf`, `.detect_order`, `.order_name` | no |
+| `ggufhdr.supported_versions`, `.latest_version`, `.count_width`, `.header_bytes`, `.header_range` | no |
+| `ggufhdr.default_alignment`, `.alignment_is_valid`, `.align_up` | no |
+| `ggufval.value_type_code`, `.value_type_of_code`, `.value_type_name`, `.scalar_width` | no |
+| `ggufval.is_fixed_width`, `.is_integer_type`, `.is_unsigned_type`, `.max_array_depth` | no |
+| `ggufval.value_kind`, `.value_depth`, `.encoded_bytes`, `.kv_bytes`, `.describe` | no |
+| `ggufval.as_int`, `.as_float`, `.as_bool`, `.as_str`, `.as_list`, `.as_str_list`, `.as_int_list`, `.as_float_list` | no |
+| `ggufmeta.of_entries`, `.entries_of`, `.count`, `.keys`, `.duplicates`, `.find`, `.has`, `.prefixed` | no |
+| `ggufmeta.int_at`, `.float_at`, `.bool_at`, `.str_at`, `.list_at`, `.str_list_at`, `.int_list_at`, `.float_list_at` | no |
+| `ggufmeta.int_or`, `.float_or`, `.bool_or`, `.str_or` | no |
+| `ggufmeta`'s thirteen named key constants, and `arch_key` with its eight scoped keys | no |
+| `ggufmeta.architecture`, `.alignment`, `.chat_template` | no |
+| `ggufinfo.max_rank`, `.rank`, `.element_count`, `.row_elements`, `.row_count` | no |
+| `ggufinfo.tensor_bytes`, `.tensor_range`, `.row_range`, `.entry_bytes`, `.validate` | no |
+| `ggufinfo.find`, `.names`, `.by_offset`, `.with_prefix`, `.data_bytes`, `.check_layout`, `.type_histogram` | no |
+| `ggufquant.type_code`, `.type_of_code`, `.type_name`, `.type_of_name`, `.known_types` | no |
+| `ggufquant.block_elements`, `.block_bytes`, `.bits_per_weight` | no |
+| `ggufquant.is_quantized`, `.is_k_quant`, `.is_iq_type`, `.is_ternary`, `.is_file_type` | no |
+| `ggufquant.withdrawn_codes`, `.withdrawn_name` | no |
+| `ggufquant.row_bytes`, `.tensor_bytes`, `.blocks_in_row`, `.block_range` | no |
+| `ggufrange.range`, `.empty`, `.range_end`, `.range_fits`, `.slice`, `.sub`, `.join`, `.overlaps` | no |
+| `ggufread.reader`, `.need`, `.offer`, `.is_done`, `.index_of` | no |
+| `ggufread.stage_name`, `.entries_seen`, `.tensors_seen` | no |
+| `ggufread.parse_index`, `.read_index`, `.index_range`, `.tensor_range`, `.data_range`, `.check_index` | no |
+| `ggufwrite.writer`, `.default_writer`, `.rewriter` | no |
+| `ggufwrite.push_kv`, `.push_kvs`, `.set_kv`, `.drop_kv`, `.push_tensor`, `.push_tensors` | no |
+| `ggufwrite.index_bound`, `.data_at`, `.planned_offsets`, `.finish`, `.write_into` | no |
+| `gguferr.is_corrupt`, `.fault_offset`, `.fault_stage`, `GgufFault.message` | no |
 
-**The architecture prefixes its own keys.**  A Llama model's layer count
-is `llama.block_count` and a Qwen2 model's is `qwen2.block_count`, so a
-reader has to read `general.architecture` first and build every other
-key name from it.  `ggufmeta.arch_key` is that concatenation and the
-eight named helpers over it are the hyperparameters every decoder-only
-architecture declares.
+## Licence
 
-**`general.file_type` is a hint, not a fact.**  It names what the
-quantiser was *asked* for; the tensor-info table names what each tensor
-actually *is*, and a mixed quantisation makes them disagree by design.
-`ggufinfo.type_histogram` is what tells a user their "Q4_K_M" file is
-four different quantisations, which it is.
+Apache-2.0. See `LICENSE`.
 
-## The layer, and the claim this package does not make
-
-`core`, and the format makes it easy: a GGUF is an index, and reading an
-index is arithmetic over bytes the caller already holds.  There is not
-one effect row in the package except `read_index`'s bound `[e]`, which
-spends nothing.
-
-**No `@tier(embedded)` claim**, and the reason is worth writing down
-rather than leaving as an omission.  A device probe would build, because
-nothing here needs a heap that a `Bytes` does not — but the claim would
-be dishonest in a more useful sense: a GGUF is addressed by 64-bit
-offsets into a file measured in gigabytes, the consumer is a host loader
-feeding an accelerator, and the microcontroller that wants to read one
-does not exist yet.  The audit's `core-embedded` row passes and says the
-package makes no claim.  If an edge consumer appears — a device
-streaming a 50 MB model off external flash — the split to make is
-lz4-nv's: an integer-only module for the arithmetic and the `Bytes`
-modules beside it.
-
-## What this package does not depend on
-
-**Not ndarray-nv.**  This package never holds a tensor.  It holds the
-tensor's name, its dimensions, its GGML type and the byte range its data
-occupies, and hands all four to whoever is going to dequantise.  An
-array library in the dependency list would be downloaded by every
-consumer and used by no function.
-
-**Not a float16 package.**  The scalar widths reported here are integers,
-and the one place a half-precision *number* would be needed is
-dequantisation, which is not here.  No GGUF metadata value is ever F16:
-the thirteen value types are in `ggufval`, and F32 and F64 are the only
-floats among them.
-
-## Naming
-
-Every public type and every enum variant starts `Gguf`, and every module
-file starts `gguf`.  That is not decoration: struct and enum identity is
-keyed by **name** across a whole assembly, dependencies included, so two
-packages that both declare `Header` cannot be used by one program.  The
-rule covers variant names, which is why the faults are `GgufBadMagic`
-and `GgufOutputFull` rather than the short nouns.
-
-It bites inside a package too.  The metadata value types are
-`GgufTypeUint32` and the tensor types are `GgufQ4_K` — two enums that
-would both want to be called "type", so one of them says so in every
-variant.
-
-## What is the specification, and what is this package's choice
-
-**The GGUF specification and `ggml-common.h`, and binding**: the four
-characters, the version field, the two counts and their two widths, the
-thirteen value type codes, the string-as-length-and-bytes encoding, the
-array's element type before its count, the tensor entry's
-name/rank/dims/type/offset order, the maximum rank of four, the default
-alignment of 32, the rule that the data blob starts at the first
-multiple of the alignment after the tensor-info table, every GGML type
-code, and every block struct's size.
-
-**This package's choice**: refusing an unknown value-type code rather
-than treating it as the end of the table; naming the five withdrawn
-tensor types instead of reporting them as unknown; bounding array
-nesting at eight, which the format does not bound at all; answering the
-FIRST entry for a duplicated key, and offering `duplicates` rather than
-refusing the file; refusing a misaligned tensor offset, which llama.cpp
-reads and mis-addresses; `check_layout` being a separate call from
-parsing, so a tool repairing a damaged checkpoint can read the table
-before it is told the table is wrong; and the writer emitting the index
-only, never the weights.
-
-## The reference implementation
-
-[ggml](https://github.com/ggml-org/ggml)'s GGUF specification, its
-`gguf.c` reader and `ggml-common.h`'s block definitions, and
-[gguf-py](https://github.com/ggml-org/llama.cpp/tree/master/gguf-py)'s
-`GGUFReader`, whose byte-order test this package copies.  The oracle
-arrives with the bodies: a set of small published checkpoints read with
-`gguf-py` and with this package, every key, every tensor offset and
-every size compared, as a generated run beside the two suites in
-`tests/`.
-
-Apache-2.0.
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
